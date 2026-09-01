@@ -45,8 +45,11 @@ CASES = [
     ("리픽싱 주기 3개월", dict(rfx_cyc=3., _gap=3.), None),
     ("최저 조정가액 700", dict(floor=700.), None),
     ("액면가 750", dict(floor=700., par=750.), None),
-    ("조정일 처리 · 확률가중", dict(carry=2, _gap=3.), None),
-    ("조정일 처리 · 특정노드", dict(carry=3, _gap=3.), None),
+    # 조정 주기가 2스텝이면 사이 칸이 하나뿐이라 세 근사가 수학적으로 같아진다.
+    # 12개월로 늘려 4스텝을 만들어야 갈라진다.
+    ("조정일 처리 · 경로가중", dict(rfx_cyc=12., carry=1, _gap=3.), None),
+    ("조정일 처리 · 확률가중", dict(rfx_cyc=12., carry=2, _gap=3.), None),
+    ("조정일 처리 · 특정노드", dict(rfx_cyc=12., carry=3, _gap=3.), None),
     # 조기상환
     ("조기상환 시작 12개월", dict(p_s=12.), None),
     ("조기상환 종료 36개월", dict(p_e=36., _gap=3.), None),
@@ -55,9 +58,11 @@ CASES = [
     ("조기상환 보장 5%", dict(p_mode="accrue", p_yield=.05), None),
     ("보장 복리 연 2회", dict(p_mode="accrue", p_yield=.05, p_cmp=2), None),
     # 매도청구
-    ("매도청구 시작 6개월", dict(k_s=6., k_lock=6., _gap=3.), None),
-    ("매도청구 종료 36개월", dict(k_e=36., k_lock=36., _gap=3.), None),
-    ("매도청구 주기 1개월", dict(k_f=1., _gap=3.), None),
+    ("매도청구 시작 6개월", dict(k_s=6., k_lock=0., _gap=3.), None),
+    ("매도청구 종료 36개월", dict(k_e=36., k_lock=0., _gap=3.), None),
+    # 의무보유가 매도청구 종료보다 늦으면 첫 행사일에 콜이 확정되어 주기가
+    # 결과를 못 움직인다. 주기 배선을 보려면 의무보유를 풀어야 한다.
+    ("매도청구 주기 9개월 · 의무보유 없음", dict(k_f=9., k_lock=0., _gap=3.), None),
     ("매도청구 프리미엄 6%", dict(k_prem=.06), None),
     ("매도청구 한도 60%", dict(k_w=.6), None),
     ("의무보유 40개월", dict(k_lock=40.), None),
@@ -76,9 +81,9 @@ CASES = [
     ("신용 복리 연 2회", dict(cmp_cr=2), None),
     ("현물 곡선 입력", dict(y_type="spot"), None),
     # 매도청구 주기가 조기상환 주기와 다른 경우 — 예전에 한쪽을 잘못 참조했다
-    ("매도청구 주기 ≠ 조기상환", dict(k_f=1., p_f=6., k_e=36., _gap=3.), None),
+    ("매도청구 주기 ≠ 조기상환", dict(k_f=9., p_f=6., k_e=36., k_lock=0., _gap=3.), None),
     ("중간평가 · 분기 노드", dict(d_base="2026-03-31", _gap=3.), None),
-    ("중간평가 · 리픽싱 5개월", dict(d_base="2026-03-31", rfx_cyc=5., _gap=3.), None),
+    ("중간평가 · 리픽싱 12개월", dict(d_base="2026-03-31", rfx_cyc=12., _gap=3.), None),
     # 결과를 안 움직이는 것이 정상인 설정
     ("전자등록총액 500억", dict(face_total=5e10),
      "100 기준 결과는 그대로다. 전액 기준 환산 열만 바뀐다."),
@@ -181,14 +186,14 @@ def run_one(idx):
            "want": [eng[k] for _, _, k in ROWS],
            "alloc": got[acc].get("C12"),
            "dr": got[acc].get("C22"), "cr": got[acc].get("D22"),
-           "gap": "_gap" in over}
+           "gap": over.get("_gap", 6.0)}
     print("@@" + json.dumps(out), flush=True)
     return 0
 
 
 def main():
     import json, subprocess
-    bad, dead, base = [], [], None
+    bad, dead, base = [], [], {}      # 기준선은 격자별로 따로 잡는다
     print("%-22s %10s %10s %10s %10s %10s  %s"
           % ("설정", "70%", "30%", "주계약", "부채요소", "매도청구", "판정"))
     for idx in range(len(CASES)):
@@ -214,14 +219,13 @@ def main():
                 or abs(o["dr"] - o["cr"]) > 1e-4
                 or abs(o["dr"] - (100 + eng_ca)) > 1e-4):
             ok = False; bad.append(f"{lbl} · 분개 대차: {o['dr']} / {o['cr']}")
-        if base is None:
-            base = vals
+        g = o["gap"]
+        if g not in base:
+            base[g] = vals                     # 그 격자의 첫 케이스가 기준선이다
             moved = True
-        elif o["gap"]:
-            moved = True                       # 격자가 달라 기준선 비교가 의미 없다
         else:
             moved = any(v is not None and b is not None and abs(v - b) > 1e-6
-                        for v, b in zip(vals, base))
+                        for v, b in zip(vals, base[g]))
         mark = "" if ok else "★불일치"
         if ok and not moved and why is None:
             dead.append(lbl); mark = "★안 움직임"
