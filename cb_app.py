@@ -489,11 +489,15 @@ def eir_table(tm: Terms, host):
     c = 100*tm.cpn*tm.ipay/12
     per = max(1e-6, tm.ipay/12)
     red = 100*(1 + accrue_rate(tm.T + tm.elapsed_m/12, tm.ytm, tm.cpn, tm.ytm_cmp))
-    # 지급 시점. 마지막 구간은 만기에 맞춰 기말 장부금액이 만기상환금액과 떨어지게 한다
+    # 지급 시점. 마지막 구간은 만기에 맞춰 기말 장부금액이 만기상환금액과 떨어지게 한다.
+    # 남는 조각이 지급주기의 10% 미만이면 직전 회차에 붙여 1일짜리 회차를 만들지 않는다.
     ts, k = [], 1
     while k*per < tm.T - 1e-9:
         ts.append(k*per); k += 1
-    ts.append(tm.T)
+    if ts and tm.T - ts[-1] < per*0.1:
+        ts[-1] = tm.T
+    else:
+        ts.append(tm.T)
     nper = len(ts)
     def pv(r):
         return (sum(c*(1+r)**(-t) for t in ts[:-1])
