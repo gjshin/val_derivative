@@ -1007,16 +1007,13 @@ def build_xlsx(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     sec(E, rr+3, "2. 분개", span=5)
     for i, h in enumerate(["계정", "차변 (100)", "대변 (100)", "차변 (원)", "대변 (원)"]):
         put(E, rr+4, 2+i, h, bold=True, fill=LIGHT, align="center", border=True, size=9)
-    if tm.conv_class == "liability":
-        deriv = b2 - b0 - ca
-        je = [("현금", 100.0, None), ("파생상품자산 (매도청구권)", ca, None),
-              ("　전환사채 (주계약 · 잔여)", None, 100-deriv+ca),
-              ("　파생상품부채 (내재파생상품)", None, deriv)]
-    else:
-        je = [("현금", 100.0, None), ("파생상품자산 (매도청구권)", ca, None),
-              ("　전환사채 (주계약)", None, b0),
-              ("　파생상품부채 (조기상환청구권)", None, b1-b0),
-              ("　전환권대가 (자본 · 잔여)", None, conv)]
+    # 분개는 배분표(al)를 그대로 뒤집어 만든다. 따로 계산하면 두 표가 어긋난다.
+    # 음수 항목(매도청구권 자산)만 차변으로, 나머지는 대변으로 간다.
+    je = [("현금", 100.0, None)]
+    for k, v in al[:-1]:
+        nm = k.split(" · ")[0]
+        if v < 0: je.append((f"파생상품자산 ({nm})", -v, None))
+        else:     je.append((f"　{nm}", None, v))
     for i, (k, dr, cr) in enumerate(je):
         put(E, rr+5+i, 2, k, size=9, border=True)
         put(E, rr+5+i, 3, dr if dr is not None else "", fmt=N2, align="right", border=True)
@@ -1503,8 +1500,8 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
              ("조기상환청구권", "=C14-C13"),
              ("매도청구권자산", f"={K['cw']}*(C6-C8)"),
              ("전환권대가 (자본일 때)", f'=IF({K["eqcls"]}=1,100-C14+C16,"")'),
-             ("내재파생상품 (부채일 때)", f'=IF({K["eqcls"]}=0,C6-C13-C16,"")'),
-             ("주계약 잔여 (부채일 때)", f'=IF({K["eqcls"]}=0,100-C18+C16,"")')]
+             ("복합내재파생상품 (부채일 때)", f'=IF({K["eqcls"]}=0,C6-C13,"")'),
+             ("주계약 잔여 (부채일 때)", f'=IF({K["eqcls"]}=0,100+C16-C18,"")')]
     for i, (nm, fx) in enumerate(items):
         r = 13+i
         put(R, r, 2, nm, bold=True, border=True)
@@ -1559,10 +1556,10 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     for i, h in enumerate(["계정", "차변 (100)", "대변 (100)", "차변 (원)", "대변 (원)"]):
         put(E, 15, 2+i, h, bold=True, fill=LIGHT, align="center", border=True, size=9)
     je2 = [("현금", "=100", None), ("파생상품자산 (매도청구권)", "=결과!C16", None),
-           ("　전환사채 (주계약)", None, "=C7"),
-           ("　파생상품부채 (조기상환청구권)", None, f'=IF({K["eqcls"]}=1,C8,"")'),
-           ("　파생상품부채 (내재파생상품)", None, f'=IF({K["eqcls"]}=0,C9,"")'),
-           ("　전환권대가 (자본)", None, f'=IF({K["eqcls"]}=1,C11,"")')]
+           ("　전환사채 (주계약)", None, f'=IF({K["eqcls"]}=1,결과!C13,결과!C19)'),
+           ("　파생상품부채 (조기상환청구권)", None, f'=IF({K["eqcls"]}=1,결과!C15,"")'),
+           ("　파생상품부채 (복합내재파생상품)", None, f'=IF({K["eqcls"]}=0,결과!C18,"")'),
+           ("　전환권대가 (자본)", None, f'=IF({K["eqcls"]}=1,결과!C17,"")')]
     for i, (nm, dr, cr) in enumerate(je2):
         r = 16+i
         put(E, r, 2, nm, size=9, border=True)
