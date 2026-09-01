@@ -150,9 +150,17 @@ def make_curve(par_pts, Tmax, m=1):
     return lambda t: spot[0][1] if t <= 0 else _lin(spot, t)
 
 
-def spot_from_zero(pts):
-    """이미 현물이자율(이산)로 받은 경우 — 연속복리로만 바꾼다."""
-    cont = [(t, math.log(1+r)) for t, r in pts]
+def spot_from_zero(pts, m=1):
+    """이미 현물이자율(이산)로 받은 경우 — 연속복리로 바꾼다.
+
+    m 은 그 현물이자율의 복리 횟수다. 국고채는 연복리로 고시되는 경우가 많지만
+    회사채 제로커브는 분기복리인 경우가 있다. 복리 횟수를 무시하고 ln(1+r) 로만
+    환산하면 할인계수와 위험중립확률이 어긋난다 (책 3.7.4.4 오류 사례).
+
+        연속 = m · ln(1 + r/m)        m=1 이면 ln(1+r) 로 되돌아온다
+    """
+    m = max(1, int(m))
+    cont = [(t, m*math.log(1 + r/m)) for t, r in pts]
     return lambda t: cont[0][1] if t <= 0 else _lin(cont, t)
 
 
@@ -210,7 +218,9 @@ def curves(tm: Terms):
     cc = credit_curve(tm)
     if len(tm.rf_curve) >= 2 and len(cc) >= 2:
         if tm.y_type == "spot":
-            return spot_from_zero(tm.rf_curve), spot_from_zero(cc)
+            # 현물이자율은 고시된 복리 횟수로 연속환산한다 (책 3.7.4.4)
+            return (spot_from_zero(tm.rf_curve, tm.cmp_rf),
+                    spot_from_zero(cc, tm.cmp_cr))
         return (make_curve(tm.rf_curve, tm.T, tm.cmp_rf),
                 make_curve(cc, tm.T, tm.cmp_cr))
     # 곡선이 아직 없을 때의 임시값 — 화면이 경고를 띄운다
@@ -822,7 +832,8 @@ def build_xlsx(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         ("매도청구권 평가방법", K_METHODS[tm.k_method], None)]),
       ("5. 시장 인풋", [("변동성 σ", tm.sig, P2),
         ("무위험 이표 (연 회)", tm.cmp_rf, N0), ("위험 이표 (연 회)", tm.cmp_cr, N0),
-        ("이자율 입력", "만기수익률 곡선" if tm.y_type == "par" else "현물이자율 곡선", None),
+        ("이자율 입력", ("만기수익률 곡선" if tm.y_type == "par"
+                     else f"현물이자율 곡선 (무위험 {tm.cmp_rf}회·위험 {tm.cmp_cr}회 복리)"), None),
         (f"{tm.T:.2f}년 무위험 (연속)", RF(tm.T), P2),
         (f"{tm.T:.2f}년 위험 (연속)", CR(tm.T), P2)]),
       ("6. 격자 파라미터", [("상승계수 u", full["u"], N4), ("하락계수 d", full["d"], N4),
@@ -1778,6 +1789,13 @@ with st.sidebar:
     with st.expander("이자율", expanded=True):
         st.caption("무위험·위험 모두 만기수익률(YTM) 곡선을 넣습니다. "
                    "앱이 선형보간 → 부트스트래핑 → 선도이자율 순으로 처리합니다.")
+        t.y_type = st.selectbox("입력 유형", ["par", "spot"],
+                                index=0 if t.y_type == "par" else 1,
+                                format_func=lambda x: "만기수익률 (YTM)" if x == "par"
+                                else "현물이자율 (zero rate)")
+        if t.y_type == "spot":
+            st.caption("아래 **이표 횟수**를 고시된 곡선의 **복리 횟수**로 맞추십시오. "
+                       "회사채 제로커브가 분기복리인데 연복리로 두면 할인계수가 어긋납니다.")
         unit = st.selectbox("만기 단위", ["auto", "month", "year"], index=0,
                             format_func=lambda x: {"auto": "자동 인식", "month": "개월",
                                                    "year": "년"}[x])
@@ -2073,6 +2091,28 @@ with tabs[7]:
                               columns=["항목", "값", "판정"]),
                  use_container_width=True, hide_index=True)
     st.caption("위험중립가중치가 0과 1을 벗어나면 변동성이나 노드 수 설정이 잘못된 것입니다.")
+
+    st.markdown("**조기상환권 분리 판단** — 기준서 1109 문단 B4.3.5(5)")
+    # 행사금액은 발행일부터 붙으므로 p_s(발행일 기준 개월)를 그대로 쓴다
+    _pv = (100*(1 + accrue_rate(t.p_s/12, t.p_yield, t.cpn, t.p_cmp))
+           if t.p_mode == "accrue" else t.p_rate)
+    _pt = max(0.0, (t.p_s - t.elapsed_m)/12)       # 평가기준일 기준 첫 조기상환일
+    _rw = eir_table(t, b0)[1]
+    _bv = next((en for _, tt_, _b, _i, _c, en in _rw if tt_ >= _pt - 1e-9), b0)
+    _gap = abs(_pv - _bv)/max(_bv, 1e-9)
+    st.dataframe(pd.DataFrame([
+        ["첫 조기상환일 행사금액", f"{_pv:,.2f}"],
+        ["같은 시점 주계약 상각후원가", f"{_bv:,.2f}"],
+        ["차이", f"{_gap*100:.1f}%"]],
+        columns=["항목", "값"]), use_container_width=True, hide_index=True)
+    if _gap > 0.10:
+        st.success("행사금액과 상각후원가가 거의 같지 않으므로 조기상환권을 주계약과 "
+                   "분리합니다. 앱의 배분도 분리를 전제로 합니다.")
+    else:
+        st.warning("행사금액이 상각후원가와 거의 같습니다. 문단 B4.3.5(5)(가) 예외에 "
+                   "해당해 분리하지 않을 여지가 있습니다. 앱은 항상 분리하므로 "
+                   "회계처리 탭의 배분을 그대로 쓰기 전에 판단을 확인하십시오.")
+    st.caption("자본요소를 분리하기 **전에** 판단해야 하는 항목입니다 (문단 B4.3.5 말미).")
 
     st.markdown("**금리모형(BDT 등) 적용 필요여부**")
     RFc, CRc = curves(t)
