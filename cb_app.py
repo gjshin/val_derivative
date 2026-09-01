@@ -33,6 +33,7 @@ class Terms:
     cpn: float = 0.0            # 표면이자율
     ipay: float = 3.0           # 이자 지급주기 (개월)
     ytm: float = 0.0            # 만기보장수익률
+    ytm_cmp: int = 4            # 만기보장수익률 복리 횟수 (분기)
     cv_s: float = 12.0          # 전환 시작 (개월)
     cv_e: float = 59.0
     rfx_mode: int = 2           # 0 없음 / 1 하향만 / 2 하향+상향
@@ -50,6 +51,7 @@ class Terms:
     k_prem: float = 0.01
     k_w: float = 0.30
     k_lock: float = 25.0
+    k_method: int = 0            # 0 유무가치비교 / 1 혼합할인율 / 2 지분·부채 분리
     sig: float = 0.4130
     model: str = "TF"
     conv_class: str = "equity"   # equity 전환권 자본 / liability 전환권 파생상품부채
@@ -58,7 +60,6 @@ class Terms:
     p_mode: str = "fixed"        # fixed 고정률 / accrue 보장수익률 복리
     p_yield: float = 0.0         # 조기상환 보장수익률
     p_cmp: int = 4               # 조기상환 보장수익률 복리 횟수
-    k_mode: str = "accrue"       # 매도청구 금액 산정 방식
     face_total: float = 25_000_000_000.0   # 전자등록총액 (원)
     rate_mode: str = "direct"     # direct 곡선 직접 / rating 등급 보간
     rt_a: str = "BBB+"            # 인풋 곡선 A 등급
@@ -66,9 +67,22 @@ class Terms:
     rt_tgt: str = "BBB0"          # 평가대상 등급
     cr_curve_b: list = field(default_factory=list)
     y_type: str = "par"           # par 만기수익률 / spot 현물이자율
-    px_adjusted: bool = True      # 수정주가 사용 여부
     rf_curve: list = field(default_factory=list)   # [(만기, 연이율)]
     cr_curve: list = field(default_factory=list)
+
+
+def accrue_rate(t_year: float, g: float, c: float, m: int) -> float:
+    """상환할증금률. 미지급 보장수익률을 매 회차 적립해 굴린 연금의 미래가치다.
+
+        Σ_{k=1..mt} ((g−c)/m)·(1+g/m)^(mt−k)  =  (g−c)/g · ((1+g/m)^(mt) − 1)
+
+    표면이자율 c 를 빼는 것은 그만큼 이미 현금으로 지급했기 때문이다.
+    c 가 0 이면 (1+g/m)^(mt) − 1 로 줄어 종전 산식과 같아진다.
+    """
+    if t_year <= 0: return 0.0
+    m = max(1, int(m))
+    if g <= 1e-12: return (g - c)*t_year        # g → 0 극한
+    return (g - c)/g * ((1 + g/m)**(m*t_year) - 1)
 
 
 def months_between(d1: dt.date, d2: dt.date) -> float:
@@ -231,18 +245,21 @@ def engine(tm: Terms, conv=True, put=True, call=False, conv_start=None):
     pay_per = max(1, int(round(tm.ipay*mper)))
     is_pay = lambda i: tm.cpn > 0 and i > 0 and i % pay_per == 0
     cpn_amt = 100*tm.cpn*tm.ipay/12
-    red = 100 + (tm.ytm - tm.cpn)*100*(T + ey)
+    red = 100*(1 + accrue_rate(T + ey, tm.ytm, tm.cpn, tm.ytm_cmp))
     S = lambda i, j: tm.S0 * u**j * d**(i-j)
     clip = lambda s: min(max(s, tm.floor, tm.par), tm.K0)
     def put_amt(i):
         """행사금액은 발행일부터 붙는다. 경과분을 더해 계산한다."""
         if tm.p_mode == "accrue":
-            eff = (1 + tm.p_yield/max(1, tm.p_cmp))**tm.p_cmp - 1
-            return 100*(1+eff)**(i*dt_ + ey)
+            return 100*(1 + accrue_rate(i*dt_ + ey, tm.p_yield, tm.cpn, tm.p_cmp))
         return tm.p_rate
     put_a = lambda i: put_amt(i) if (put and in_set(i, tm.p_s, tm.p_e, tm.p_f)) else 0.0
-    call_a = lambda i: (100*(1+tm.k_prem)**(i*dt_ + ey)
-                        if (call and in_set(i, tm.k_s, tm.k_e, tm.k_f)) else math.inf)
+    # kstrike 는 콜 스위치와 무관한 행사금액이다. 행사기간이 아니면 None.
+    # call_a 는 call=False 면 항상 inf 라 제3자 콜옵션 평가에 쓸 수 없다.
+    kstrike = lambda i: (100*(1 + accrue_rate(i*dt_ + ey, tm.k_prem, tm.cpn, 1))
+                         if in_set(i, tm.k_s, tm.k_e, tm.k_f) else None)
+    call_a = lambda i: (kstrike(i) if (call and in_set(i, tm.k_s, tm.k_e, tm.k_f))
+                        else math.inf)
     conv_ok = lambda i: conv and max(st_(cs), 0) <= i <= st_(tm.cv_e)
     exact = (tm.rfx_mode > 0 and tm.carry == 0)
 
@@ -290,6 +307,8 @@ def engine(tm: Terms, conv=True, put=True, call=False, conv_start=None):
                 return clip(s) if tm.rfx_mode == 2 else clip(min(K, s))
             KU = nk(S(i, j)*u) if exact else Kg[i+1][j+1]
             KD = nk(S(i, j)*d) if exact else Kg[i+1][j]
+            ku = (i+1, j+1, round(KU, 6)) if exact else (i+1, j+1)
+            kd = (i+1, j,   round(KD, 6)) if exact else (i+1, j)
             a, b = rec(i+1, j+1, KU), rec(i+1, j, KD)
             q = qi(i); c = cpn_amt if is_pay(i) else 0.0
             fr, fc = fwd(RF, i), fwd(CR, i)
@@ -305,7 +324,8 @@ def engine(tm: Terms, conv=True, put=True, call=False, conv_start=None):
             pv, kv = put_a(i), call_a(i)
             hold = E + B; inner = min(hold, kv)
             Vg = max(cv, pv, min(Vc, kv))
-            ex = dict(hold=hold, cv=cv, K=KK, pv=pv, kv=kv, Vc=Vc)
+            # up·dn 은 자식 노드 키다. 만기 노드에는 없어 자식 없음의 표시가 된다.
+            ex = dict(hold=hold, cv=cv, K=KK, pv=pv, kv=kv, Vc=Vc, up=ku, dn=kd)
             if i == 0:               o = dict(E=E, B=B, V=Vc, P=pr, kind="hold", **ex)
             elif cv >= max(pv, inner): o = dict(E=cv, B=0.0, V=Vg, P=1.0, kind="conv", **ex)
             elif pv >= inner:          o = dict(E=0.0, B=pv, V=Vg, P=0.0, kind="put", **ex)
@@ -345,12 +365,75 @@ def engine(tm: Terms, conv=True, put=True, call=False, conv_start=None):
         layer = nxt
     dist["mat"] = sum(v[0] for v in layer.values())
 
+    root = (0, 0, round(tm.K0, 6)) if exact else (0, 0)
     return dict(TF=r0["E"]+r0["B"], E=r0["E"], B=r0["B"], GS=r0["V"], P=r0["P"],
                 q=qi(0), u=u, d=d, dt=dt_, mper=mper, n=n, memo=memo, Kg=Kg,
-                exact=exact, S=S, host=100*math.exp(-CR(T)*T), dist=dist)
+                exact=exact, S=S, host=100*math.exp(-CR(T)*T), dist=dist,
+                root=root, qi=qi, fwdRF=lambda i: fwd(RF, i),
+                fwdCR=lambda i: fwd(CR, i), kstrike=kstrike)
 
 
 def pick(res, model): return res["GS"] if model == "GS" else res["TF"]
+
+def call_third_party(tm: Terms, full, method: int) -> float:
+    """제3자 지정 가능 콜옵션 — 옵션차익혼합할인법.
+
+    한국공인회계사회 『K-IFRS 실무사례와 해설 11 복합금융상품』 4.4.3 과
+    부속예제 [사례 4-4] 의 산식이다. 발행자가 지정한 제3자에게 넘어갈 수 있는
+    콜옵션은 기준서 1109 문단 4.3.1 상 별도의 금융상품이고, 기초자산이
+    전환사채인 복합옵션(an option on an option)이므로 격자 안에서
+    MIN(계속보유, 콜금액) 으로 누르는 발행자 콜옵션과 다르게 평가한다.
+
+    기초자산은 ``콜과 그 부속조항(의무보유 등)을 포함하지 않은 전환사채`` 다.
+    ``decompose`` 가 넘기는 ``full = engine(tm, call=False)`` 이 정확히 그것이라
+    새 격자를 만들지 않고 그 memo 를 한 번 더 역진한다.
+
+    method 1  혼합할인율      — 값 하나를 자식의 구성비율로 섞은 할인율로 할인
+    method 2  지분·부채 분리   — 페이오프를 구성비율로 쪼개 각각 Rf·Rd 로 할인
+    """
+    memo, dt_ = full["memo"], full["dt"]
+    qi, fRF, fCR = full["qi"], full["fwdRF"], full["fwdCR"]
+    kstrike = full["kstrike"]
+    cache = {}
+
+    def w(o):
+        """구성비율 — 노드 가치 중 지분 몫."""
+        v = o["E"] + o["B"]
+        return o["E"]/v if v > 1e-12 else 0.0
+
+    def rec(key, i):
+        if key in cache: return cache[key]
+        o = memo[key]
+        K = kstrike(i)
+        pay = max(o["E"] + o["B"] - K, 0.0) if K is not None else 0.0
+        if "up" not in o:                       # 만기 — 자식이 없다
+            ww = w(o)
+            r = (pay, pay*ww, pay*(1-ww))
+        else:
+            q, ou, od = qi(i), memo[o["up"]], memo[o["dn"]]
+            cu, eu, bu = rec(o["up"], i+1)
+            cd, ed, bd = rec(o["dn"], i+1)
+            if method == 1:
+                yu = w(ou)*fRF(i) + (1-w(ou))*fCR(i)
+                yd = w(od)*fRF(i) + (1-w(od))*fCR(i)
+                cont = q*cu*math.exp(-yu*dt_) + (1-q)*cd*math.exp(-yd*dt_)
+                r = (max(pay, cont), 0.0, 0.0)
+            else:
+                he = (q*eu + (1-q)*ed) * math.exp(-fRF(i)*dt_)
+                hb = (q*bu + (1-q)*bd) * math.exp(-fCR(i)*dt_)
+                if pay >= he + hb:
+                    ww = w(o); r = (pay, pay*ww, pay*(1-ww))
+                else:
+                    r = (he + hb, he, hb)
+        cache[key] = r
+        return r
+
+    return rec(full["root"], 0)[0]
+
+
+K_METHODS = {0: "유무가치비교법", 1: "옵션차익혼합할인법 · 혼합할인율",
+             2: "옵션차익혼합할인법 · 지분·부채 분리"}
+
 
 def decompose(tm: Terms):
     derive(tm)
@@ -358,8 +441,12 @@ def decompose(tm: Terms):
     b0 = pick(engine(tm, conv=False, put=False, call=False), tm.model)
     b1 = pick(engine(tm, conv=False, put=True, call=False), tm.model)
     b2 = pick(full, tm.model)
-    b3 = pick(engine(tm, conv=True, put=True, call=True, conv_start=tm.k_lock), tm.model)
-    ca = tm.k_w*(b2-b3)
+    if tm.k_method:
+        # 제3자 지정 가능 콜옵션 — 기초자산은 콜·의무보유를 뺀 full 그대로다
+        ca = tm.k_w*call_third_party(tm, full, tm.k_method)
+    else:
+        b3 = pick(engine(tm, conv=True, put=True, call=True, conv_start=tm.k_lock), tm.model)
+        ca = tm.k_w*(b2-b3)
     resid = 100 - b1 + ca          # 전환권이 자본일 때의 잔여 (전환권대가)
     return full, b0, b1, b2, ca, resid
 
@@ -367,13 +454,20 @@ def allocate(tm: Terms, full, b0, b1, b2, ca):
     """최초 인식 배분.  전환권 분류에 따라 무엇을 잔여로 두는지가 뒤바뀐다."""
     if tm.conv_class == "liability":
         # 전환권이 파생상품부채 — 내재파생을 공정가치로 두고 주계약을 잔여로
-        deriv = b2 - b0 - ca            # 전환권 + 조기상환권 (매도청구권은 자산이므로 차감)
-        host_acc = 100 - deriv + ca
+        # 전환권과 조기상환권은 상호의존적이라 하나의 복합내재파생상품으로 묶어
+        # 전체로서(as a whole) 측정한다 (기준서 1109 문단 B4.3.4).
+        # 매도청구권은 제3자 지정이 가능해 별도의 금융상품이므로(1109 문단 4.3.1)
+        # 이 묶음에 넣지 않는다. 발행가액은 전환사채와 콜옵션에 배분하므로
+        # 전환사채에 배분된 금액은 100 + ca 다 (사례 1105 해설2).
+        deriv = b2 - b0
+        host_acc = (100 + ca) - deriv
         rows = [("주계약 (잔여)", host_acc),
-                ("내재파생상품 · 파생상품부채", deriv),
+                ("복합내재파생상품 · 파생상품부채", deriv),
                 ("매도청구권 · 파생상품자산", -ca)]
-        note = ("전환권이 파생상품부채이므로 내재파생상품을 공정가치로 측정하고 "
-                "주계약을 잔여로 둡니다. 이론적 주계약가치는 " + f"{b0:,.2f}" + " 입니다.")
+        note = ("전환권이 파생상품부채이므로 전환권과 조기상환권을 하나의 "
+                "복합내재파생상품으로 묶어 공정가치로 측정하고 주계약을 잔여로 둡니다 "
+                "(기준서 1109 문단 B4.3.4). 전환사채에 배분된 금액은 "
+                f"{100+ca:,.2f} 이고 이론적 주계약가치는 {b0:,.2f} 입니다.")
     else:
         rows = [("주계약 (옵션 없는 사채)", b0),
                 ("조기상환청구권 · 파생상품부채", b1-b0),
@@ -393,22 +487,31 @@ def allocate_full(tm: Terms, rows):
 
 def eir_table(tm: Terms, host):
     c = 100*tm.cpn*tm.ipay/12
-    per = tm.ipay/12
-    nper = max(1, round(tm.T/per))
-    red = 100 + (tm.ytm-tm.cpn)*100*tm.T
+    per = max(1e-6, tm.ipay/12)
+    red = 100*(1 + accrue_rate(tm.T + tm.elapsed_m/12, tm.ytm, tm.cpn, tm.ytm_cmp))
+    # 지급 시점. 마지막 구간은 만기에 맞춰 기말 장부금액이 만기상환금액과 떨어지게 한다.
+    # 남는 조각이 지급주기의 10% 미만이면 직전 회차에 붙여 1일짜리 회차를 만들지 않는다.
+    ts, k = [], 1
+    while k*per < tm.T - 1e-9:
+        ts.append(k*per); k += 1
+    if ts and tm.T - ts[-1] < per*0.1:
+        ts[-1] = tm.T
+    else:
+        ts.append(tm.T)
+    nper = len(ts)
     def pv(r):
-        s = sum(c*(1+r)**(-k*per) for k in range(1, nper+1))
-        return s + red*(1+r)**(-tm.T)
+        return (sum(c*(1+r)**(-t) for t in ts[:-1])
+                + (c + red)*(1+r)**(-tm.T))
     lo, hi = -0.5, 5.0
     for _ in range(200):
         m = (lo+hi)/2
         if pv(m) > host: lo = m
         else: hi = m
     r = (lo+hi)/2
-    rows, bv = [], host
-    for k in range(1, nper+1):
-        it = bv*((1+r)**per - 1); end = bv + it - c
-        rows.append((k, k*per, bv, it, c, end)); bv = end
+    rows, bv, prev = [], host, 0.0
+    for k, t in enumerate(ts, 1):
+        it = bv*((1+r)**(t-prev) - 1); end = bv + it - c
+        rows.append((k, t, bv, it, c, end)); bv, prev = end, t
     return r, rows, red, nper
 
 
@@ -439,8 +542,7 @@ def validate(tm: Terms):
 # 4. 주가·변동성
 # ══════════════════════════════════════════════════════════
 @st.cache_data(show_spinner=False, ttl=3600)
-def fetch_prices(code: str, days: int, market: str, adjusted: bool = True,
-                 end: str = None):
+def fetch_prices(code: str, days: int, market: str, end: str = None):
     """야후 파이낸스에서 수정주가를 받는다.
 
     auto_adjust=True 라 유상증자·액면분할·배당이 반영된 종가가 온다.
@@ -478,11 +580,40 @@ def vol_from(prices, tdays=250, drop_outlier=True):
     removed, lo, hi = 0, None, None
     if drop_outlier:
         M = float(np.median(r)); mad = float(np.median(np.abs(r-M)))*1.4826
-        lo, hi = M-3*mad, M+3*mad
+        lo, hi = M-2.5*mad, M+2.5*mad   # 사례 5-2 와 같은 배수
         keep = (r >= lo) & (r <= hi); removed = int((~keep).sum()); r = r[keep]
     sd = float(np.std(r, ddof=1))
     return dict(daily=sd, annual=sd*math.sqrt(tdays), n=len(px)-1,
                 removed=removed, lo=lo, hi=hi)
+
+
+def read_upload(name: str, data: bytes) -> str:
+    """업로드 파일을 텍스트로 편다.
+
+    엑셀은 시트를 탭 구분 텍스트로 바꾼다. csv·txt 는 한글 인코딩을 차례로
+    시도한다. 증권사·거래소에서 내려받은 파일은 대개 CP949 다.
+    """
+    low = name.lower()
+    if low.endswith((".xlsx", ".xlsm")):
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        out = []
+        for row in wb.worksheets[0].iter_rows(values_only=True):
+            cells = ["" if v is None else
+                     (v.strftime("%Y-%m-%d") if hasattr(v, "strftime") else str(v))
+                     for v in row]
+            if any(cells): out.append("\t".join(cells))
+        wb.close()
+        return "\n".join(out)
+    if low.endswith(".xls"):
+        raise ValueError("옛 형식(.xls)은 읽지 못합니다. 엑셀에서 .xlsx 로 저장해 주십시오.")
+    for enc in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
+        try:
+            txt = data.decode(enc)
+            if "�" not in txt: return txt
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", "ignore")
 
 
 def parse_prices(txt: str):
@@ -601,17 +732,17 @@ def build_xlsx(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     is_rfx = lambda i: tm.rfx_mode > 0 and i > 0 and stp(tm.rfx_cyc) > 0 and i % stp(tm.rfx_cyc) == 0
     REFIXC = {i for i in range(1, n+1) if is_rfx(i)}
     cpn_amt = 100*tm.cpn*tm.ipay/12
-    red = 100 + (tm.ytm-tm.cpn)*100*tm.T
+    ey = tm.elapsed_m/12                     # 경과 연수 — 행사금액은 발행일부터 붙는다
+    red = 100*(1 + accrue_rate(tm.T + ey, tm.ytm, tm.cpn, tm.ytm_cmp))
     def in_set(i, a, b, fr): return stp(a) <= i <= stp(b) and (i-stp(a)) % max(1, stp(fr)) == 0
     def put_amt(i):
         if not in_set(i, tm.p_s, tm.p_e, tm.p_f): return 0.0
         if tm.p_mode == "accrue":
-            eff = (1+tm.p_yield/max(1, tm.p_cmp))**tm.p_cmp - 1
-            return 100*(1+eff)**(i*dt_)
+            return 100*(1 + accrue_rate(i*dt_ + ey, tm.p_yield, tm.cpn, tm.p_cmp))
         return tm.p_rate
     def call_amt(i, on=True):
         if not on or not in_set(i, tm.k_s, tm.k_e, tm.k_f): return 999999
-        return 100*(1+tm.k_prem)**(i*dt_)
+        return 100*(1 + accrue_rate(i*dt_ + ey, tm.k_prem, tm.cpn, 1))
 
     HEAD = ["Date", "time-step", "Flag(전환)", "Flag(조기상환)", "Flag(매도청구)",
             "Flag(리픽싱)", "조기상환금액", "매도청구금액", "쿠폰", "만기상환",
@@ -687,7 +818,8 @@ def build_xlsx(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         ("조기상환 행사금액 산정", "보장수익률 복리" if tm.p_mode == "accrue" else "고정률", None),
         ("매도청구 시작 / 종료 / 주기", tm.k_s, N0), ("　  ", tm.k_e, N0), ("　   ", tm.k_f, N0),
         ("매도청구 프리미엄", tm.k_prem, P2), ("매도청구 한도", tm.k_w, P2),
-        ("의무보유 전환지연 (개월)", tm.k_lock, N0)]),
+        ("의무보유 전환지연 (개월)", tm.k_lock, N0),
+        ("매도청구권 평가방법", K_METHODS[tm.k_method], None)]),
       ("5. 시장 인풋", [("변동성 σ", tm.sig, P2),
         ("무위험 이표 (연 회)", tm.cmp_rf, N0), ("위험 이표 (연 회)", tm.cmp_cr, N0),
         ("이자율 입력", "만기수익률 곡선" if tm.y_type == "par" else "현물이자율 곡선", None),
@@ -842,7 +974,11 @@ def build_xlsx(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     for cc, w in (("B", 34), ("C", 14), ("D", 14), ("E", 18), ("F", 18), ("G", 30)):
         E.column_dimensions[cc].width = w
     title(E, 2, "회계처리", span=6)
-    put(E, 3, 2, "기업회계기준서 제1032호 문단 31 — 부채요소를 먼저 정하고 나머지를 자본에 배분한다.",
+    put(E, 3, 2, "기업회계기준서 제1032호 문단 31·32 — 부채요소를 먼저 정하고 나머지를 자본에 배분한다. "
+        "매도청구권은 제3자에게 이전될 수 있어 별도의 금융상품이다 (제1109호 문단 4.3.1, "
+        "회계기준원 질의회신 2022-I-KQA006, 금융위 2022.5.3 감독지침). "
+        "전환권이 부채이면 전환권과 조기상환권은 상호의존적이므로 하나의 복합내재파생상품으로 "
+        "전체로서 측정한다 (제1109호 문단 B4.3.4).",
         color=GREY, size=9)
     sec(E, 5, "1. 최초 인식 배분", span=5)
     fac = tm.face_total
@@ -1015,7 +1151,10 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         ("표면이자율", "cpn", tm.cpn, P2, True),
         ("이자 지급주기 (스텝)", "ipay", max(1, int(round(tm.ipay*mper))), N0, True),
         ("만기보장수익률", "ytm", tm.ytm, P2, True),
-        ("만기상환금액", "red", "@=100+(C{ytm}-C{cpn})*100*(C{T}+C{elm}/12)", N2, False),
+        ("만기보장 복리 횟수", "ycm", tm.ytm_cmp, N0, True),
+        ("만기상환금액", "red",
+         "@=IF(C{ytm}<=0,100+(C{ytm}-C{cpn})*100*(C{T}+C{elm}/12),"
+         "100*(1+(C{ytm}-C{cpn})/C{ytm}*((1+C{ytm}/C{ycm})^(C{ycm}*(C{T}+C{elm}/12))-1)))", N2, False),
         ("최저 조정가액", "flr", tm.floor, N2, True),
         ("액면가", "par", tm.par, N2, True),
         ("리픽싱 상한", "cap", "@=C{K0}", N2, False),
@@ -1382,7 +1521,11 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     for cc, w in (("B", 34), ("C", 14), ("D", 14), ("E", 18), ("F", 18)):
         E.column_dimensions[cc].width = w
     title(E, 2, "회계처리", span=5)
-    put(E, 3, 2, "기업회계기준서 제1032호 문단 31 — 부채요소를 먼저 정하고 나머지를 자본에 배분한다.",
+    put(E, 3, 2, "기업회계기준서 제1032호 문단 31·32 — 부채요소를 먼저 정하고 나머지를 자본에 배분한다. "
+        "매도청구권은 제3자에게 이전될 수 있어 별도의 금융상품이다 (제1109호 문단 4.3.1, "
+        "회계기준원 질의회신 2022-I-KQA006, 금융위 2022.5.3 감독지침). "
+        "전환권이 부채이면 전환권과 조기상환권은 상호의존적이므로 하나의 복합내재파생상품으로 "
+        "전체로서 측정한다 (제1109호 문단 B4.3.4).",
         color=GREY, size=9)
     sec(E, 5, "1. 최초 인식 배분", span=5)
     for i, h in enumerate(["항목", "100 기준", "전액 기준 (원)"]):
@@ -1531,11 +1674,14 @@ with st.sidebar:
         t.cpn = st.number_input("표면이자율 (%)", value=t.cpn*100, step=0.5)/100
         t.ipay = st.number_input("이자 지급주기 (개월)", value=float(t.ipay), step=1.0)
         t.ytm = st.number_input("만기보장수익률 (%)", value=t.ytm*100, step=0.1, format="%.4f")/100
+        t.ytm_cmp = int(st.number_input("만기보장 복리 횟수 (연)", value=int(t.ytm_cmp),
+                                        step=1, min_value=1, max_value=12,
+                                        help="공시 상환율이 분기복리면 4, 반기면 2."))
         t.face_total = st.number_input("전자등록총액 (원)", value=float(t.face_total),
                                        step=1e8, format="%.0f",
                                        help="회계처리 탭의 전액 기준 금액을 계산합니다.")
-        st.caption(f"만기상환금액 = {100+(t.ytm-t.cpn)*100*(t.T+t.elapsed_m/12):,.4f}   "
-                   "복리 조건이면 공시 상환율에서 역산해 넣으십시오.")
+        st.caption(f"만기상환금액 = {100*(1+accrue_rate(t.T+t.elapsed_m/12, t.ytm, t.cpn, t.ytm_cmp)):,.4f}   "
+                   "공시 만기상환율과 대조하십시오.")
 
     with st.expander("전환 · 조정"):
         st.caption("모두 **발행일 기준 개월**입니다. 계약서 그대로 넣으십시오.")
@@ -1568,6 +1714,16 @@ with st.sidebar:
         t.k_prem = st.number_input("프리미엄 (연 %)", value=t.k_prem*100, step=0.5)/100
         t.k_w = st.number_input("행사 한도 (%)", value=t.k_w*100, step=5.0)/100
         t.k_lock = st.number_input("의무보유 전환지연 (개월)", value=float(t.k_lock), step=1.0)
+        t.k_method = st.selectbox("평가방법", [0, 1, 2],
+                                  index=[0, 1, 2].index(t.k_method),
+                                  format_func=lambda i: K_METHODS[i])
+        if t.k_method:
+            st.caption("발행회사가 **지정하는 제3자**도 행사할 수 있는 콜옵션은 별도의 "
+                       "금융상품이고 기초자산이 전환사채인 복합옵션입니다 "
+                       "(기준서 1109 문단 4.3.1). 기초자산에서 **의무보유는 빠집니다.**")
+        else:
+            st.caption("콜을 넣고 뺀 두 평가액의 차이로 봅니다. 의무보유 효과가 콜 값에 "
+                       "포함됩니다.")
 
     with st.expander("변동성", expanded=True):
         c1, c2 = st.columns([2, 1])
@@ -1584,22 +1740,28 @@ with st.sidebar:
         if st.button("주가 수집", use_container_width=True, type="secondary"):
             with st.spinner("받는 중"):
                 try:
-                    px, src = fetch_prices(code.strip(), pdays, mkt, True, asof.isoformat())
+                    px, src = fetch_prices(code.strip(), pdays, mkt, asof.isoformat())
                     st.session_state.prices = px
                     st.session_state.px_src = src
                     st.success(f"{src} · {len(px)}개 · {px[0][0]} ~ {px[-1][0]}")
                 except Exception as ex:
                     st.error(f"받지 못했습니다 — {ex}\n\n"
                              "종목코드와 시장을 확인하시거나 아래에서 파일을 넣으십시오.")
-        pf = st.file_uploader("주가 파일 (csv · txt)", type=["csv", "txt", "tsv"], key="pxf")
+        pf = st.file_uploader("주가 파일 (엑셀 · csv · txt)",
+                              type=["xlsx", "xlsm", "xls", "csv", "txt", "tsv"], key="pxf")
         if pf is not None:
-            rows = parse_prices(pf.getvalue().decode("utf-8", "ignore"))
-            if len(rows) >= 10:
-                st.session_state.prices = rows
-                st.session_state.px_src = pf.name
-                st.success(f"{pf.name} · {len(rows)}개")
+            try:
+                rows = parse_prices(read_upload(pf.name, pf.getvalue()))
+            except Exception as ex:
+                st.error(str(ex))
             else:
-                st.error("종가를 10개 이상 찾지 못했습니다. 날짜와 종가가 있는 파일인지 확인하십시오.")
+                if len(rows) >= 10:
+                    st.session_state.prices = rows
+                    st.session_state.px_src = pf.name
+                    st.success(f"{pf.name} · {len(rows)}개")
+                else:
+                    st.error(f"종가를 {len(rows)}개밖에 찾지 못했습니다. "
+                             "머리글에 '종가' 또는 'Close' 가 있는지 확인하십시오.")
         if st.session_state.prices:
             v = vol_from(st.session_state.prices, tdays, drop)
             if v:
@@ -1911,6 +2073,33 @@ with tabs[7]:
                               columns=["항목", "값", "판정"]),
                  use_container_width=True, hide_index=True)
     st.caption("위험중립가중치가 0과 1을 벗어나면 변동성이나 노드 수 설정이 잘못된 것입니다.")
+
+    st.markdown("**금리모형(BDT 등) 적용 필요여부**")
+    RFc, CRc = curves(t)
+    def _bump(**kw):
+        tt = Terms(**asdict(t))
+        for k2, v2 in kw.items(): setattr(tt, k2, v2)
+        derive(tt); return pick(engine(tt, call=False), t.model)
+    d_rate = (_bump(rf_curve=[(x, y+0.01) for x, y in t.rf_curve])
+              - _bump(rf_curve=[(x, y-0.01) for x, y in t.rf_curve]))/2
+    d_vol = (_bump(sig=t.sig+0.10) - _bump(sig=max(0.01, t.sig-0.10)))/2
+    ratio = abs(d_rate)/max(abs(d_vol), 1e-9)
+    spr = CRc(t.T) - RFc(t.T)
+    share = spr/CRc(t.T) if CRc(t.T) > 1e-9 else 0.0
+    st.dataframe(pd.DataFrame([
+        ["무위험금리 ±1%p", f"{d_rate:+,.4f}", f"{abs(d_rate)/max(b2,1e-9)*100:.2f}%"],
+        ["변동성 ±10%p", f"{d_vol:+,.4f}", f"{abs(d_vol)/max(b2,1e-9)*100:.2f}%"],
+        ["금리 ÷ 주가 민감도", f"{ratio:.3f}", ""],
+        [f"{t.T:.2f}년 신용스프레드", f"{spr*100:.2f}%p", f"할인율 중 {share*100:.0f}%"]],
+        columns=["항목", "값", "비중"]), use_container_width=True, hide_index=True)
+    if ratio < 0.2 or share > 0.7:
+        st.success("금리를 확률변수로 둘 실익이 작습니다. 신용스프레드가 값을 지배하므로 "
+                   "금리 고정 격자로 충분합니다.")
+    else:
+        st.warning("금리 민감도가 무시할 수준이 아닙니다. BDT 등 금리모형 적용 여부를 "
+                   "검토하고 그 판단을 조서에 남기십시오.")
+    st.caption("책 [사례 4-3] 실측 — 금리변동성 20%를 넣어도 조기상환권이 "
+               "832.14에서 836.22로 0.49%만 움직입니다.")
 
 with tabs[8]:
     st.write("가정 · 트리 시트 · 이자율곡선 · 결과 · 회계처리 · 상각표로 이루어진 조서를 만듭니다. "
