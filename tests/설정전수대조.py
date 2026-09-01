@@ -41,7 +41,9 @@ CASES = [
     ("전환 종료 48개월", dict(cv_e=48.), None),
     # 리픽싱 — 성긴 격자에서는 주기가 모두 1스텝으로 뭉개져 _gap 을 준다
     ("리픽싱 없음", dict(rfx_mode=0), None),
-    ("하향만 리픽싱", dict(rfx_mode=1, _gap=3.), None),
+    # 주기 7개월·분기 노드에서는 상향 허용 여부가 결과를 안 바꾼다(엔진도 같은 값).
+    # 12개월로 늘리면 1.49 만큼 갈린다.
+    ("하향만 리픽싱", dict(rfx_mode=1, rfx_cyc=12., _gap=3.), None),
     ("리픽싱 주기 3개월", dict(rfx_cyc=3., _gap=3.), None),
     ("최저 조정가액 700", dict(floor=700.), None),
     ("액면가 750", dict(floor=700., par=750.), None),

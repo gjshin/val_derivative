@@ -1331,6 +1331,8 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     W2 = wb.create_sheet("도달확률"); W2.sheet_view.showGridLines = False
     W2.column_dimensions["B"].width = 12
     title(W2, 2, "도달확률  P = COMBIN(스텝, r) × q^(스텝−r) × (1−q)^r", span=min(n+1, 12))
+    put(W2, 3, 2, "q 는 그 열의 위험중립가중치다 (① 16행). 이월 계산에서 직전 열을 "
+        "참조하므로 열마다 제 q 를 써야 엔진과 맞는다.", color=GREY, size=9)
     put(W2, 4, 2, "r ＼ 스텝", bold=True, size=8, fill=LIGHT, border=True, align="center")
     for i in range(n+1):
         W2.column_dimensions[gl(3+i)].width = 9
@@ -1338,7 +1340,9 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     for r in range(n+1):
         put(W2, 5+r, 2, r, bold=True, size=8, fmt=N0, align="center", fill=LIGHT, border=True)
         for i in range(r, n+1):
-            put(W2, 5+r, 3+i, f"=COMBIN({i},{r})*{K['q']}^({i}-{r})*{K['q1']}^{r}",
+            qq = f"{Q(S1)}!{gl(3+i)}$16"
+            put(W2, 5+r, 3+i,
+                f"=COMBIN({i},{r})*{qq}^({i}-{r})*(1-{qq})^{r}",
                 fmt='0.000000', size=8, align="right")
     W2.freeze_panes = "C5"
 
@@ -1357,8 +1361,10 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         if up is None: carry = dn
         elif dn is None: carry = up
         else:
-            m1 = f"({up}*{uP}*{L}$16+{dn}*{dP}*{L}$17)/({uP}*{L}$16+{dP}*{L}$17)"
-            m2 = f"({up}*{L}$16+{dn}*{L}$17)"
+            # q 는 직전 구간의 것이다. 엔진도 qi(i-1) 을 쓴다.
+            m1 = (f"({up}*{uP}*{Lp}$16+{dn}*{dP}*{Lp}$17)"
+                  f"/({uP}*{Lp}$16+{dP}*{Lp}$17)")
+            m2 = f"({up}*{Lp}$16+{dn}*{Lp}$17)"
             carry = f"IF({K['mth']}=1,{m1},IF({K['mth']}=2,{m2},{dn}))"
         return f"=IF({K['rfx']}=0,{K['K0']},IF({L}$6=1,{clip},{carry}))"
     fill(W, kf, N2)
