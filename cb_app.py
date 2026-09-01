@@ -305,10 +305,14 @@ def engine(tm: Terms, conv=True, put=True, call=False, conv_start=None):
             KK = K if exact else Kg[n][j]
             cv = 100*S(n, j)/KK if conv_ok(n) else 0.0
             pv = put_a(n)
-            if cv >= max(pv, red) and cv > 0:
+            # 만기에도 이자 지급일이면 이자를 함께 받는다 (책 5-7 만기 현금흐름).
+            # 전환을 택하면 주식을 받으므로 중간 노드와 같이 이자는 사라진다.
+            cm = cpn_amt if is_pay(n) else 0.0
+            cash = max(pv, red) + cm
+            if cv >= max(cash, 0.0) and cv > 0:
                 o = dict(E=cv, B=0.0, V=cv, P=1.0, kind="conv", hold=red, cv=cv, K=KK)
             else:
-                o = dict(E=0.0, B=max(pv, red), V=max(pv, red), P=0.0, kind="mat",
+                o = dict(E=0.0, B=cash, V=cash, P=0.0, kind="mat",
                          hold=red, cv=cv, K=KK)
         else:
             def nk(s):
@@ -1347,7 +1351,7 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
                  "전환이면 0, 상환이면 그 금액, 보유면 다음 열을 위험 선도이자율로 할인.",
                  f"{S9} · 다음 열 {S6}", call_on=False)
     fill(W, lambda i, r, L, Lp, Ln: (
-        f'=IF({Q(S9)}!{L}{R0+r}="전환",0,MAX({L}$7,{L}$10))' if i == n else
+        f'=IF({Q(S9)}!{L}{R0+r}="전환",0,MAX({L}$7,{L}$10)+{L}$9)' if i == n else
         f'=IF({Q(S9)}!{L}{R0+r}="상환P",{L}$7,IF({Q(S9)}!{L}{R0+r}="상환C",{L}$8,'
         f'IF({Q(S9)}!{L}{R0+r}="전환",0,'
         f'({Ln}{R0+r}*{Ln}$16+{Ln}{R0+r+1}*{Ln}$17)*EXP(-{Ln}$12*{K["dt"]})+{L}$9)))'))
@@ -1355,7 +1359,7 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     W = newsheet(S7, "⑦ 보유가치트리",
                  "지분은 무위험, 부채는 위험 선도이자율로 따로 할인해 더한다. 이것이 TF다.",
                  f"다음 열 {S5} · {S6}", call_on=False)
-    fill(W, lambda i, r, L, Lp, Ln: (f"={L}$10" if i == n else
+    fill(W, lambda i, r, L, Lp, Ln: (f"={L}$10+{L}$9" if i == n else
          f"=({Q(S5)}!{Ln}{R0+r}*{Ln}$16+{Q(S5)}!{Ln}{R0+r+1}*{Ln}$17)"
          f"*EXP(-{Ln}$11*{K['dt']})"
          f"+({Q(S6)}!{Ln}{R0+r}*{Ln}$16+{Q(S6)}!{Ln}{R0+r+1}*{Ln}$17)"
@@ -1365,7 +1369,8 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
                  "70% 트랜치 — 매도청구권이 걸리지 않는다. 콜은 ⑮에서만 반영한다.",
                  f"{S4} · {S7}", call_on=False)
     fill(W, lambda i, r, L, Lp, Ln:
-         f"=MAX({Q(S7)}!{L}{R0+r},{Q(S4)}!{L}{R0+r},{L}$7)")
+         f"=MAX({Q(S7)}!{L}{R0+r},{Q(S4)}!{L}{R0+r},{L}$7"
+         + (f"+{L}$9)" if i == n else ")"))
 
     W = newsheet(S9, "⑨ 의사결정트리",
                  "금융상품가치가 무엇과 같은지로 판정한다. 70% 트랜치라 상환C 는 없다.",
@@ -1376,7 +1381,7 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
 
     W = newsheet(S10, "⑩ 주계약가치트리  옵션이 전혀 없는 순수 사채",
                  "주가와 무관하므로 같은 열의 값이 모두 같다.", "가정")
-    fill(W, lambda i, r, L, Lp, Ln: (f"={L}$10" if i == n else
+    fill(W, lambda i, r, L, Lp, Ln: (f"={L}$10+{L}$9" if i == n else
          f"=({Ln}{R0+r}*{Ln}$16+{Ln}{R0+r+1}*{Ln}$17)*EXP(-{Ln}$12*{K['dt']})"
          f"+{L}$9+{L}$10"))
 
@@ -1395,14 +1400,15 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
 
     W = newsheet(S13, "⑬ [GS] 보유가치트리",
                  "다음 두 칸을 각 칸의 할인율로 따로 할인한다.", f"다음 열 {S12} · {S14}", call_on=False)
-    fill(W, lambda i, r, L, Lp, Ln: (f"={L}$10" if i == n else
+    fill(W, lambda i, r, L, Lp, Ln: (f"={L}$10+{L}$9" if i == n else
          f"={Q(S14)}!{Ln}{R0+r}*{Ln}$16*EXP(-{Q(S12)}!{Ln}{R0+r}*{K['dt']})"
          f"+{Q(S14)}!{Ln}{R0+r+1}*{Ln}$17*EXP(-{Q(S12)}!{Ln}{R0+r+1}*{K['dt']})+{L}$9"))
 
     W = newsheet(S14, "⑭ [GS] 금융상품가치트리",
                  "⑧과 같은 칸을 비교하면 모형 차이가 보인다.", f"{S4} · {S13}", call_on=False)
     fill(W, lambda i, r, L, Lp, Ln:
-         f"=MAX({Q(S13)}!{L}{R0+r},{Q(S4)}!{L}{R0+r},{L}$7)")
+         f"=MAX({Q(S13)}!{L}{R0+r},{Q(S4)}!{L}{R0+r},{L}$7"
+         + (f"+{L}$9)" if i == n else ")"))
 
     # ── 15 30% 트랜치 ──
     W = newsheet(S15, "⑮ 30% 트랜치  매도청구권이 걸리는 부분",
@@ -1432,12 +1438,12 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
                     fmt=(None if tx else fm), size=8, align=("center" if tx else "right"))
             p(c1, f"=IF({L}$3=1,{Q(S1)}!{L}{R0+r}*{Q(S3)}!{L}{R0+r},0)")
             if i == n:
-                p(c5, f"=MAX({L}{c1+1+r},{L}$7,{L}$10)")
+                p(c5, f"=MAX({L}{c1+1+r},MAX({L}$7,{L}$10)+{L}$9)")
                 p(c6, f'=IF({L}{c5+1+r}={L}{c1+1+r},"전환",'
                       f'IF({L}{c5+1+r}={L}$7,"상환P","만기상환"))', tx=True)
                 p(c2, f'=IF({L}{c6+1+r}="전환",{L}{c1+1+r},0)')
-                p(c3, f'=IF({L}{c6+1+r}="전환",0,MAX({L}$7,{L}$10))')
-                p(c4, f"={L}$10")
+                p(c3, f'=IF({L}{c6+1+r}="전환",0,MAX({L}$7,{L}$10)+{L}$9)')
+                p(c4, f"={L}$10+{L}$9")
                 continue
             e = f"({Ln}{c2+1+r}*{Ln}$16+{Ln}{c2+2+r}*{Ln}$17)*EXP(-{Ln}$11*{K['dt']})"
             b = f"({Ln}{c3+1+r}*{Ln}$16+{Ln}{c3+2+r}*{Ln}$17)*EXP(-{Ln}$12*{K['dt']})"
@@ -1479,7 +1485,7 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
              f"100*{K['cpn']}*{K['ipay']}*{K['dt']},0)", N2)
         g(9, f"=IF({i}={K['n']},{K['red']},0)", N2)
         if i < n: g(10, forward_rate(CR, i*dt_, (i+1)*dt_), P2, AMB)
-        g(11, (f"=MAX({L}$7,{L}$9)" if i == n else
+        g(11, (f"=MAX({L}$7,{L}$9)+{L}$8" if i == n else
                f"=MAX({L}$7,{Ln}11*EXP(-{L}$10*{K['dt']})+{L}$8)"), N2)
     put(D, 13, 2, "부채요소 (t=0)", bold=True)
     put(D, 13, 3, "=C11", bold=True, fmt=N2, align="right")
