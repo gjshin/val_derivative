@@ -501,6 +501,35 @@ def vol_from(prices, tdays=250, drop_outlier=True):
                 removed=removed, lo=lo, hi=hi)
 
 
+def read_upload(name: str, data: bytes) -> str:
+    """업로드 파일을 텍스트로 편다.
+
+    엑셀은 시트를 탭 구분 텍스트로 바꾼다. csv·txt 는 한글 인코딩을 차례로
+    시도한다. 증권사·거래소에서 내려받은 파일은 대개 CP949 다.
+    """
+    low = name.lower()
+    if low.endswith((".xlsx", ".xlsm")):
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        out = []
+        for row in wb.worksheets[0].iter_rows(values_only=True):
+            cells = ["" if v is None else
+                     (v.strftime("%Y-%m-%d") if hasattr(v, "strftime") else str(v))
+                     for v in row]
+            if any(cells): out.append("\t".join(cells))
+        wb.close()
+        return "\n".join(out)
+    if low.endswith(".xls"):
+        raise ValueError("옛 형식(.xls)은 읽지 못합니다. 엑셀에서 .xlsx 로 저장해 주십시오.")
+    for enc in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
+        try:
+            txt = data.decode(enc)
+            if "�" not in txt: return txt
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", "ignore")
+
+
 def parse_prices(txt: str):
     out, close_idx, start = [], -1, 0
     lines = [l.strip() for l in txt.splitlines() if l.strip()]
@@ -1613,15 +1642,21 @@ with st.sidebar:
                 except Exception as ex:
                     st.error(f"받지 못했습니다 — {ex}\n\n"
                              "종목코드와 시장을 확인하시거나 아래에서 파일을 넣으십시오.")
-        pf = st.file_uploader("주가 파일 (csv · txt)", type=["csv", "txt", "tsv"], key="pxf")
+        pf = st.file_uploader("주가 파일 (엑셀 · csv · txt)",
+                              type=["xlsx", "xlsm", "xls", "csv", "txt", "tsv"], key="pxf")
         if pf is not None:
-            rows = parse_prices(pf.getvalue().decode("utf-8", "ignore"))
-            if len(rows) >= 10:
-                st.session_state.prices = rows
-                st.session_state.px_src = pf.name
-                st.success(f"{pf.name} · {len(rows)}개")
+            try:
+                rows = parse_prices(read_upload(pf.name, pf.getvalue()))
+            except Exception as ex:
+                st.error(str(ex))
             else:
-                st.error("종가를 10개 이상 찾지 못했습니다. 날짜와 종가가 있는 파일인지 확인하십시오.")
+                if len(rows) >= 10:
+                    st.session_state.prices = rows
+                    st.session_state.px_src = pf.name
+                    st.success(f"{pf.name} · {len(rows)}개")
+                else:
+                    st.error(f"종가를 {len(rows)}개밖에 찾지 못했습니다. "
+                             "머리글에 '종가' 또는 'Close' 가 있는지 확인하십시오.")
         if st.session_state.prices:
             v = vol_from(st.session_state.prices, tdays, drop)
             if v:
