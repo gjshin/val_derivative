@@ -28,6 +28,8 @@ CASES = [
     ("GS · 전환권 부채", dict(model="GS", conv_class="liability")),
     ("GS · 옵션차익혼합할인법", dict(model="GS", k_method=1)),
     ("전환권 부채", dict(conv_class="liability")),
+    ("방법2 지분·부채 분리", dict(k_method=2)),
+    ("방법2 · 전환권 부채", dict(k_method=2, conv_class="liability")),
 ]
 
 
@@ -50,7 +52,8 @@ def build(G, over, path):
     full, b0, b1, b2, ca, conv = decompose(t)
     b3 = G["pick"](G["engine"](t, conv=True, put=True, call=True,
                                conv_start=max(t.cv_s, t.k_lock)), t.model)
-    ctp = G["call_third_party"](t, full, 1)
+    ctp1 = G["call_third_party"](t, full, 1)
+    ctp2 = G["call_third_party"](t, full, 2)
     open(path, "wb").write(
         G["build_xlsx_formula"](t, full, b0, b1, b2, ca, conv, G["eir_table"](t, b0)))
 
@@ -69,7 +72,8 @@ def build(G, over, path):
     wb.save(path)
     al, _ = G["allocate"](t, full, b0, b1, b2, ca)
     return dict(b0=b0, b1=b1, b2=b2, gs=full["GS"], b3=b3, ca=ca, conv=conv,
-                ctp=t.k_w*ctp, al=al, eq=(t.conv_class == "equity")), \
+                ctp1=t.k_w*ctp1, ctp2=t.k_w*ctp2,
+                al=al, eq=(t.conv_class == "equity")), \
         mp["결과"], mp["회계처리"]
 
 
@@ -95,12 +99,12 @@ def main():
     BASE = [("적용 70% 트랜치", "C10", "b2"), ("70% 트랜치 GS", "C7", "gs"),
             ("적용 30% 트랜치", "C11", "b3"), ("주계약", "C16", "b0"),
             ("부채요소", "C17", "b1"), ("조기상환청구권", "C18", None),
-            ("매도청구권 옵션차익", "C20", "ctp"),
-            ("매도청구권 적용값", "C21", "ca")]
+            ("매도청구권 방법1", "C20", "ctp1"), ("매도청구권 방법2", "C21", "ctp2"),
+            ("매도청구권 적용값", "C22", "ca")]
     bad = 0
     for lbl, over in CASES:
         # 전환권대가는 자본으로 분류할 때만 나온다. 부채면 조서가 빈칸이 맞다.
-        ROWS = BASE + ([("전환권대가", "C22", "conv")]
+        ROWS = BASE + ([("전환권대가", "C23", "conv")]
                        if over.get("conv_class", "equity") == "equity" else [])
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "wb.xlsx")
