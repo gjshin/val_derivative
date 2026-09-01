@@ -11,7 +11,7 @@
 시트 이름에 %와 한글이 있으면 formulas 가 깨져서 ASCII 로 바꾼 사본을 만들어 푼다.
 노드를 10개로 줄여 계산 시간을 줄인다. 구조가 같으므로 검증에는 충분하다.
 """
-import sys, os, types, json, warnings, tempfile
+import sys, os, re, types, json, warnings, tempfile
 warnings.filterwarnings("ignore")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -42,6 +42,17 @@ def load_app():
     return m.__dict__
 
 
+def _combin(f):
+    """formulas 는 COMBIN 을 구현하지 않는다. 인수가 모두 상수라 값으로 바꾼다.
+
+    조서 자체는 정상이다. 엑셀은 COMBIN 을 계산한다. 검사 도구의 한계라
+    여기서만 우회한다.
+    """
+    import math
+    return re.sub(r"COMBIN\((\d+),(\d+)\)",
+                  lambda m: repr(math.comb(int(m.group(1)), int(m.group(2)))), f)
+
+
 def build(G, over, path):
     T, derive, decompose = G["Terms"], G["derive"], G["decompose"]
     t = T(); t.rf_curve = [(1, .0226), (3, .0240), (5, .0252)]
@@ -67,7 +78,7 @@ def build(G, over, path):
                     f = c.value
                     for o, nn in sorted(mp.items(), key=lambda x: -len(x[0])):
                         f = f.replace(f"'{o}'!", f"{nn}!").replace(f"{o}!", f"{nn}!")
-                    c.value = f
+                    c.value = _combin(f)
     for o, nn in mp.items(): wb[o].title = nn
     wb.save(path)
     al, _ = G["allocate"](t, full, b0, b1, b2, ca)

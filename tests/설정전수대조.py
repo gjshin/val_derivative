@@ -17,7 +17,7 @@
     pip install formulas
     python3 tests/설정전수대조.py
 """
-import sys, os, types, warnings, tempfile
+import sys, os, re, types, warnings, tempfile
 warnings.filterwarnings("ignore")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tests"))
@@ -37,27 +37,27 @@ CASES = [
     ("만기보장 7%", dict(ytm=.07), None),
     ("보장 복리 연 1회", dict(ytm=.07, ytm_cmp=1), None),
     # 전환
-    ("전환 시작 24개월", dict(cv_s=24.), None),
+    ("전환 시작 24개월", dict(cv_s=24., _gap=3.), None),
     ("전환 종료 48개월", dict(cv_e=48.), None),
-    # 리픽싱
+    # 리픽싱 — 성긴 격자에서는 주기가 모두 1스텝으로 뭉개져 _gap 을 준다
     ("리픽싱 없음", dict(rfx_mode=0), None),
-    ("하향만 리픽싱", dict(rfx_mode=1), None),
-    ("리픽싱 주기 3개월", dict(rfx_cyc=3.), None),
+    ("하향만 리픽싱", dict(rfx_mode=1, _gap=3.), None),
+    ("리픽싱 주기 3개월", dict(rfx_cyc=3., _gap=3.), None),
     ("최저 조정가액 700", dict(floor=700.), None),
     ("액면가 750", dict(floor=700., par=750.), None),
-    ("조정일 처리 · 확률가중", dict(carry=2), None),
-    ("조정일 처리 · 특정노드", dict(carry=3), None),
+    ("조정일 처리 · 확률가중", dict(carry=2, _gap=3.), None),
+    ("조정일 처리 · 특정노드", dict(carry=3, _gap=3.), None),
     # 조기상환
     ("조기상환 시작 12개월", dict(p_s=12.), None),
-    ("조기상환 종료 36개월", dict(p_e=36.), None),
-    ("조기상환 주기 6개월", dict(p_f=6.), None),
+    ("조기상환 종료 36개월", dict(p_e=36., _gap=3.), None),
+    ("조기상환 주기 6개월", dict(p_f=6., _gap=3.), None),
     ("조기상환 행사금액 105", dict(p_rate=105.), None),
     ("조기상환 보장 5%", dict(p_mode="accrue", p_yield=.05), None),
     ("보장 복리 연 2회", dict(p_mode="accrue", p_yield=.05, p_cmp=2), None),
     # 매도청구
-    ("매도청구 시작 6개월", dict(k_s=6.), None),
-    ("매도청구 종료 36개월", dict(k_e=36.), None),
-    ("매도청구 주기 1개월", dict(k_f=1.), None),
+    ("매도청구 시작 6개월", dict(k_s=6., k_lock=6., _gap=3.), None),
+    ("매도청구 종료 36개월", dict(k_e=36., k_lock=36., _gap=3.), None),
+    ("매도청구 주기 1개월", dict(k_f=1., _gap=3.), None),
     ("매도청구 프리미엄 6%", dict(k_prem=.06), None),
     ("매도청구 한도 60%", dict(k_w=.6), None),
     ("의무보유 40개월", dict(k_lock=40.), None),
@@ -66,17 +66,19 @@ CASES = [
     # 모형·분류
     ("변동성 25%", dict(sig=.25), None),
     ("GS", dict(model="GS"), None),
-    ("전환권 부채", dict(conv_class="liability"), None),
+    ("전환권 부채", dict(conv_class="liability"),
+     "트랜치·주계약·부채요소·매도청구권은 그대로다. 바뀌는 것은 배분표와 분개이고 "
+     "그 둘은 매 케이스마다 따로 확인한다."),
     # 곡선
     ("무위험 +2%p", dict(_rf=.02), None),
     ("신용 +3%p", dict(_cr=.03), None),
     ("무위험 복리 연 4회", dict(cmp_rf=4), None),
     ("신용 복리 연 2회", dict(cmp_cr=2), None),
     ("현물 곡선 입력", dict(y_type="spot"), None),
-    # 성긴 격자에서는 드러나지 않는 것들. 이 셋은 노드를 촘촘히 해야 잡힌다.
+    # 매도청구 주기가 조기상환 주기와 다른 경우 — 예전에 한쪽을 잘못 참조했다
+    ("매도청구 주기 ≠ 조기상환", dict(k_f=1., p_f=6., k_e=36., _gap=3.), None),
     ("중간평가 · 분기 노드", dict(d_base="2026-03-31", _gap=3.), None),
     ("중간평가 · 리픽싱 5개월", dict(d_base="2026-03-31", rfx_cyc=5., _gap=3.), None),
-    ("매도청구 주기 ≠ 조기상환", dict(k_f=1., p_f=6., k_e=36., _gap=3.), None),
     # 결과를 안 움직이는 것이 정상인 설정
     ("전자등록총액 500억", dict(face_total=5e10),
      "100 기준 결과는 그대로다. 전액 기준 환산 열만 바뀐다."),
@@ -101,9 +103,21 @@ def terms(G, over):
         if not k.startswith("_"): setattr(t, k, v)
     # 계산 시간을 줄인다. 구조는 같다. gap_m 은 반드시 _gap 으로만 준다.
     assert "gap_m" not in over, "격자는 _gap 으로 지정하십시오"
-    t.carry = 1; t.gap_m = over.get("_gap", 6.0)
+    t.gap_m = over.get("_gap", 6.0)
+    if "carry" not in over: t.carry = 1     # 상태확장은 조서로 못 옮긴다
     G["derive"](t)
     return t
+
+
+def _combin(f):
+    """formulas 는 COMBIN 을 구현하지 않는다. 인수가 모두 상수라 값으로 바꾼다.
+
+    조서 자체는 정상이다. 엑셀은 COMBIN 을 계산한다. 검사 도구의 한계라
+    여기서만 우회한다.
+    """
+    import math
+    return re.sub(r"COMBIN\((\d+),(\d+)\)",
+                  lambda m: repr(math.comb(int(m.group(1)), int(m.group(2)))), f)
 
 
 def build(G, over, path):
@@ -123,7 +137,7 @@ def build(G, over, path):
                     f = c.value
                     for o, nn in sorted(mp.items(), key=lambda x: -len(x[0])):
                         f = f.replace(f"'{o}'!", f"{nn}!").replace(f"{o}!", f"{nn}!")
-                    c.value = f
+                    c.value = _combin(f)
     for o, nn in mp.items(): wb[o].title = nn
     wb.save(path)
     return dict(b2=b2, b3=b3, b0=b0, b1=b1, ca=ca, conv=conv,
