@@ -59,7 +59,6 @@ class Terms:
     p_mode: str = "fixed"        # fixed 고정률 / accrue 보장수익률 복리
     p_yield: float = 0.0         # 조기상환 보장수익률
     p_cmp: int = 4               # 조기상환 보장수익률 복리 횟수
-    k_mode: str = "accrue"       # 매도청구 금액 산정 방식
     face_total: float = 25_000_000_000.0   # 전자등록총액 (원)
     rate_mode: str = "direct"     # direct 곡선 직접 / rating 등급 보간
     rt_a: str = "BBB+"            # 인풋 곡선 A 등급
@@ -67,7 +66,6 @@ class Terms:
     rt_tgt: str = "BBB0"          # 평가대상 등급
     cr_curve_b: list = field(default_factory=list)
     y_type: str = "par"           # par 만기수익률 / spot 현물이자율
-    px_adjusted: bool = True      # 수정주가 사용 여부
     rf_curve: list = field(default_factory=list)   # [(만기, 연이율)]
     cr_curve: list = field(default_factory=list)
 
@@ -407,22 +405,27 @@ def allocate_full(tm: Terms, rows):
 
 def eir_table(tm: Terms, host):
     c = 100*tm.cpn*tm.ipay/12
-    per = tm.ipay/12
-    nper = max(1, round(tm.T/per))
-    red = 100 + (tm.ytm-tm.cpn)*100*tm.T
+    per = max(1e-6, tm.ipay/12)
+    red = 100*(1 + accrue_rate(tm.T + tm.elapsed_m/12, tm.ytm, tm.cpn, tm.ytm_cmp))
+    # 지급 시점. 마지막 구간은 만기에 맞춰 기말 장부금액이 만기상환금액과 떨어지게 한다
+    ts, k = [], 1
+    while k*per < tm.T - 1e-9:
+        ts.append(k*per); k += 1
+    ts.append(tm.T)
+    nper = len(ts)
     def pv(r):
-        s = sum(c*(1+r)**(-k*per) for k in range(1, nper+1))
-        return s + red*(1+r)**(-tm.T)
+        return (sum(c*(1+r)**(-t) for t in ts[:-1])
+                + (c + red)*(1+r)**(-tm.T))
     lo, hi = -0.5, 5.0
     for _ in range(200):
         m = (lo+hi)/2
         if pv(m) > host: lo = m
         else: hi = m
     r = (lo+hi)/2
-    rows, bv = [], host
-    for k in range(1, nper+1):
-        it = bv*((1+r)**per - 1); end = bv + it - c
-        rows.append((k, k*per, bv, it, c, end)); bv = end
+    rows, bv, prev = [], host, 0.0
+    for k, t in enumerate(ts, 1):
+        it = bv*((1+r)**(t-prev) - 1); end = bv + it - c
+        rows.append((k, t, bv, it, c, end)); bv, prev = end, t
     return r, rows, red, nper
 
 
@@ -453,8 +456,7 @@ def validate(tm: Terms):
 # 4. 주가·변동성
 # ══════════════════════════════════════════════════════════
 @st.cache_data(show_spinner=False, ttl=3600)
-def fetch_prices(code: str, days: int, market: str, adjusted: bool = True,
-                 end: str = None):
+def fetch_prices(code: str, days: int, market: str, end: str = None):
     """야후 파이낸스에서 수정주가를 받는다.
 
     auto_adjust=True 라 유상증자·액면분할·배당이 반영된 종가가 온다.
@@ -1604,7 +1606,7 @@ with st.sidebar:
         if st.button("주가 수집", use_container_width=True, type="secondary"):
             with st.spinner("받는 중"):
                 try:
-                    px, src = fetch_prices(code.strip(), pdays, mkt, True, asof.isoformat())
+                    px, src = fetch_prices(code.strip(), pdays, mkt, asof.isoformat())
                     st.session_state.prices = px
                     st.session_state.px_src = src
                     st.success(f"{src} · {len(px)}개 · {px[0][0]} ~ {px[-1][0]}")
