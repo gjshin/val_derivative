@@ -451,11 +451,18 @@ def decompose(tm: Terms):
     b0 = pick(engine(tm, conv=False, put=False, call=False), tm.model)
     b1 = pick(engine(tm, conv=False, put=True, call=False), tm.model)
     b2 = pick(full, tm.model)
-    if tm.k_method:
+    # 행사 가능한 시점이 하나도 없으면 매도청구권은 없다.
+    ks = full["kstrike"]
+    has_call = tm.k_w > 0 and any(ks(i) is not None for i in range(full["n"]+1))
+    if not has_call:
+        ca = 0.0
+    elif tm.k_method:
         # 제3자 지정 가능 콜옵션 — 기초자산은 콜·의무보유를 뺀 full 그대로다
         ca = tm.k_w*call_third_party(tm, full, tm.k_method)
     else:
-        b3 = pick(engine(tm, conv=True, put=True, call=True, conv_start=tm.k_lock), tm.model)
+        # 의무보유는 전환을 늦추기만 한다. 전환 시작보다 이르면 아무 제약이 아니다.
+        cs = max(tm.cv_s, tm.k_lock)
+        b3 = pick(engine(tm, conv=True, put=True, call=True, conv_start=cs), tm.model)
         ca = tm.k_w*(b2-b3)
     resid = 100 - b1 + ca          # 전환권이 자본일 때의 잔여 (전환권대가)
     return full, b0, b1, b2, ca, resid
@@ -1179,7 +1186,7 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         ("매도청구 종료 (스텝)", "ken", stp(tm.k_e), N0, True),
         ("매도청구 프리미엄", "prem", tm.k_prem, P2, True),
         ("매도청구 한도", "cw", tm.k_w, P2, True),
-        ("30% 전환 시작 (스텝)", "cv30", max(0, stp(tm.k_lock)), N0, True),
+        ("30% 전환 시작 (스텝)", "cv30", max(0, stp(max(tm.cv_s, tm.k_lock))), N0, True),
         ("변동성 σ", "sig", tm.sig, P2, True),
         ("상승계수 u", "u", "@=EXP(C{sig}*SQRT(C{dt}))", N4, False),
         ("하락계수 d", "dd", "@=1/C{u}", N4, False),
