@@ -338,13 +338,17 @@ def engine(tm: Terms, conv=True, put=True, call=False, conv_start=None):
             pv, kv = put_a(i), call_a(i)
             hold = E + B; inner = min(hold, kv)
             Vg = max(cv, pv, min(Vc, kv))
+            # GS 의 전환확률은 GS 자신의 판단을 따른다. TF 와 다른 갈래를 고를 수 있다.
+            if cv > 0 and Vg == cv:      Pg = 1.0
+            elif Vg == pv or Vg == kv:   Pg = 0.0
+            else:                        Pg = pr
             # up·dn 은 자식 노드 키다. 만기 노드에는 없어 자식 없음의 표시가 된다.
             ex = dict(hold=hold, cv=cv, K=KK, pv=pv, kv=kv, Vc=Vc, up=ku, dn=kd)
-            if i == 0:               o = dict(E=E, B=B, V=Vc, P=pr, kind="hold", **ex)
-            elif cv >= max(pv, inner): o = dict(E=cv, B=0.0, V=Vg, P=1.0, kind="conv", **ex)
-            elif pv >= inner:          o = dict(E=0.0, B=pv, V=Vg, P=0.0, kind="put", **ex)
-            elif hold <= kv:           o = dict(E=E, B=B, V=Vg, P=pr, kind="hold", **ex)
-            else:                      o = dict(E=0.0, B=kv, V=Vg, P=0.0, kind="call", **ex)
+            if i == 0:               o = dict(E=E, B=B, V=Vg, P=Pg, kind="hold", **ex)
+            elif cv >= max(pv, inner): o = dict(E=cv, B=0.0, V=Vg, P=Pg, kind="conv", **ex)
+            elif pv >= inner:          o = dict(E=0.0, B=pv, V=Vg, P=Pg, kind="put", **ex)
+            elif hold <= kv:           o = dict(E=E, B=B, V=Vg, P=Pg, kind="hold", **ex)
+            else:                      o = dict(E=0.0, B=kv, V=Vg, P=Pg, kind="call", **ex)
         memo[key] = o
         return o
 
@@ -1169,6 +1173,7 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         ("Δt", "dt", "@=C{T}/C{n}", N4, False),
         ("표면이자율", "cpn", tm.cpn, P2, True),
         ("이자 지급주기 (스텝)", "ipay", max(1, int(round(tm.ipay*mper))), N0, True),
+        ("이자 지급주기 (개월)", "ipaym", tm.ipay, N2, True),
         ("만기보장수익률", "ytm", tm.ytm, P2, True),
         ("만기보장 복리 횟수", "ycm", tm.ytm_cmp, N0, True),
         ("만기상환금액", "red",
@@ -1243,12 +1248,17 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
             g(5, (f"=IF(AND({i}>={K['kst']},{i}<={K['ken']},"
                   f"MOD({i}-{K['kst']},{K['frq']})=0),1,0)" if call_on else 0), N0)
             g(6, f"=IF(AND({i}>0,MOD({i},{K['cyc']})=0),1,0)", N0, RED)
+            # 상환할증금 = (g−c)/g × ((1+g/m)^(m·t) − 1).  g 가 0 이면 (g−c)·t
             g(7, f"=IF({L}$4=1,IF({K['pyld']}>0,"
-                 f"100*((1+{K['pyld']}/{K['pcmp']})^{K['pcmp']})^({i}*{K['dt']}+{K['elm']}/12),"
+                 f"100*(1+({K['pyld']}-{K['cpn']})/{K['pyld']}*"
+                 f"((1+{K['pyld']}/{K['pcmp']})^({K['pcmp']}*({i}*{K['dt']}+{K['elm']}/12))-1)),"
                  f"{K['prate']}),0)", N2)
-            g(8, f"=IF({L}$5=1,100*(1+{K['prem']})^({i}*{K['dt']}+{K['elm']}/12),999999)", N2)
+            g(8, f"=IF({L}$5=1,IF({K['prem']}>0,"
+                 f"100*(1+({K['prem']}-{K['cpn']})/{K['prem']}*"
+                 f"((1+{K['prem']})^({i}*{K['dt']}+{K['elm']}/12)-1)),"
+                 f"100-{K['cpn']}*100*({i}*{K['dt']}+{K['elm']}/12)),999999)", N2)
             g(9, f"=IF(AND({i}>0,MOD({i},{K['ipay']})=0),"
-                 f"100*{K['cpn']}*{K['ipay']}*{K['dt']},0)", N2)
+                 f"100*{K['cpn']}*{K['ipaym']}/12,0)", N2)
             g(10, f"=IF({i}={K['n']},{K['red']},0)", N2)
             if i < n:
                 g(11, forward_rate(RF, i*dt_, (i+1)*dt_), P2, AMB)
@@ -1347,7 +1357,7 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         f'=IF({Q(S9)}!{L}{R0+r}="전환",{Q(S4)}!{L}{R0+r},0)' if i == n else
         f'=IF({Q(S9)}!{L}{R0+r}="전환",{Q(S4)}!{L}{R0+r},'
         f'IF(OR({Q(S9)}!{L}{R0+r}="상환P",{Q(S9)}!{L}{R0+r}="상환C"),0,'
-        f'({Ln}{R0+r}*{Ln}$16+{Ln}{R0+r+1}*{Ln}$17)*EXP(-{Ln}$11*{K["dt"]})))'))
+        f'({Ln}{R0+r}*{L}$16+{Ln}{R0+r+1}*{L}$17)*EXP(-{L}$11*{K["dt"]})))'))
 
     W = newsheet(S6, "⑥ 부채가치트리",
                  "전환이면 0, 상환이면 그 금액, 보유면 다음 열을 위험 선도이자율로 할인.",
@@ -1356,16 +1366,16 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         f'=IF({Q(S9)}!{L}{R0+r}="전환",0,MAX({L}$7,{L}$10)+{L}$9)' if i == n else
         f'=IF({Q(S9)}!{L}{R0+r}="상환P",{L}$7,IF({Q(S9)}!{L}{R0+r}="상환C",{L}$8,'
         f'IF({Q(S9)}!{L}{R0+r}="전환",0,'
-        f'({Ln}{R0+r}*{Ln}$16+{Ln}{R0+r+1}*{Ln}$17)*EXP(-{Ln}$12*{K["dt"]})+{L}$9)))'))
+        f'({Ln}{R0+r}*{L}$16+{Ln}{R0+r+1}*{L}$17)*EXP(-{L}$12*{K["dt"]})+{L}$9)))'))
 
     W = newsheet(S7, "⑦ 보유가치트리",
                  "지분은 무위험, 부채는 위험 선도이자율로 따로 할인해 더한다. 이것이 TF다.",
                  f"다음 열 {S5} · {S6}", call_on=False)
     fill(W, lambda i, r, L, Lp, Ln: (f"={L}$10+{L}$9" if i == n else
-         f"=({Q(S5)}!{Ln}{R0+r}*{Ln}$16+{Q(S5)}!{Ln}{R0+r+1}*{Ln}$17)"
-         f"*EXP(-{Ln}$11*{K['dt']})"
-         f"+({Q(S6)}!{Ln}{R0+r}*{Ln}$16+{Q(S6)}!{Ln}{R0+r+1}*{Ln}$17)"
-         f"*EXP(-{Ln}$12*{K['dt']})+{L}$9"))
+         f"=({Q(S5)}!{Ln}{R0+r}*{L}$16+{Q(S5)}!{Ln}{R0+r+1}*{L}$17)"
+         f"*EXP(-{L}$11*{K['dt']})"
+         f"+({Q(S6)}!{Ln}{R0+r}*{L}$16+{Q(S6)}!{Ln}{R0+r+1}*{L}$17)"
+         f"*EXP(-{L}$12*{K['dt']})+{L}$9"))
 
     W = newsheet(S8, "⑧ 금융상품가치트리",
                  "70% 트랜치 — 매도청구권이 걸리지 않는다. 콜은 ⑮에서만 반영한다.",
@@ -1384,7 +1394,7 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     W = newsheet(S10, "⑩ 주계약가치트리  옵션이 전혀 없는 순수 사채",
                  "주가와 무관하므로 같은 열의 값이 모두 같다.", "가정")
     fill(W, lambda i, r, L, Lp, Ln: (f"={L}$10+{L}$9" if i == n else
-         f"=({Ln}{R0+r}*{Ln}$16+{Ln}{R0+r+1}*{Ln}$17)*EXP(-{Ln}$12*{K['dt']})"
+         f"=({Ln}{R0+r}*{L}$16+{Ln}{R0+r+1}*{L}$17)*EXP(-{L}$12*{K['dt']})"
          f"+{L}$9+{L}$10"))
 
     W = newsheet(S11, "⑪ [GS] 전환확률트리",
@@ -1393,18 +1403,20 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         f'=IF({Q(S14)}!{L}{R0+r}={Q(S4)}!{L}{R0+r},1,0)' if i == n else
         f'=IF({Q(S14)}!{L}{R0+r}={Q(S4)}!{L}{R0+r},1,'
         f'IF(OR({Q(S14)}!{L}{R0+r}={L}$7,{Q(S14)}!{L}{R0+r}={L}$8),0,'
-        f'{Ln}{R0+r}*{Ln}$16+{Ln}{R0+r+1}*{Ln}$17))'), N4)
+        f'{Ln}{R0+r}*{L}$16+{Ln}{R0+r+1}*{L}$17))'), N4)
 
     W = newsheet(S12, "⑫ [GS] 위험조정할인율트리",
-                 "확률로 무위험과 위험을 섞는다.", S11)
+                 "이 칸을 직전 시점으로 할인할 때 쓰는 이자율이다. "
+                 "전환확률로 무위험과 위험을 섞되 직전 구간의 선도이자율을 쓴다.", S11)
     fill(W, lambda i, r, L, Lp, Ln:
-         f"={Q(S11)}!{L}{R0+r}*{L}$11+(1-{Q(S11)}!{L}{R0+r})*{L}$12", P2)
+         (f"={Q(S11)}!{L}{R0+r}*{Lp}$11+(1-{Q(S11)}!{L}{R0+r})*{Lp}$12"
+          if i > 0 else "=0"), P2)
 
     W = newsheet(S13, "⑬ [GS] 보유가치트리",
                  "다음 두 칸을 각 칸의 할인율로 따로 할인한다.", f"다음 열 {S12} · {S14}", call_on=False)
     fill(W, lambda i, r, L, Lp, Ln: (f"={L}$10+{L}$9" if i == n else
-         f"={Q(S14)}!{Ln}{R0+r}*{Ln}$16*EXP(-{Q(S12)}!{Ln}{R0+r}*{K['dt']})"
-         f"+{Q(S14)}!{Ln}{R0+r+1}*{Ln}$17*EXP(-{Q(S12)}!{Ln}{R0+r+1}*{K['dt']})+{L}$9"))
+         f"={Q(S14)}!{Ln}{R0+r}*{L}$16*EXP(-{Q(S12)}!{Ln}{R0+r}*{K['dt']})"
+         f"+{Q(S14)}!{Ln}{R0+r+1}*{L}$17*EXP(-{Q(S12)}!{Ln}{R0+r+1}*{K['dt']})+{L}$9"))
 
     W = newsheet(S14, "⑭ [GS] 금융상품가치트리",
                  "⑧과 같은 칸을 비교하면 모형 차이가 보인다.", f"{S4} · {S13}", call_on=False)
@@ -1447,8 +1459,8 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
                 p(c3, f'=IF({L}{c6+1+r}="전환",0,MAX({L}$7,{L}$10)+{L}$9)')
                 p(c4, f"={L}$10+{L}$9")
                 continue
-            e = f"({Ln}{c2+1+r}*{Ln}$16+{Ln}{c2+2+r}*{Ln}$17)*EXP(-{Ln}$11*{K['dt']})"
-            b = f"({Ln}{c3+1+r}*{Ln}$16+{Ln}{c3+2+r}*{Ln}$17)*EXP(-{Ln}$12*{K['dt']})"
+            e = f"({Ln}{c2+1+r}*{L}$16+{Ln}{c2+2+r}*{L}$17)*EXP(-{L}$11*{K['dt']})"
+            b = f"({Ln}{c3+1+r}*{L}$16+{Ln}{c3+2+r}*{L}$17)*EXP(-{L}$12*{K['dt']})"
             p(c4, f"={e}+{b}+{L}$9")
             p(c5, f"=IF({L}$5=1,MAX(MIN({L}{c4+1+r},{L}$8),{L}{c1+1+r},{L}$7),"
                   f"MAX({L}{c4+1+r},{L}{c1+1+r},{L}$7))")
@@ -1481,10 +1493,11 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         g(6, f"=IF(AND({i}>={K['pst']},{i}<={K['pen']},"
              f"MOD({i}-{K['pst']},{K['frq']})=0),1,0)", N0)
         g(7, f"=IF({L}$6=1,IF({K['pyld']}>0,"
-             f"100*((1+{K['pyld']}/{K['pcmp']})^{K['pcmp']})^({i}*{K['dt']}+{K['elm']}/12),"
+             f"100*(1+({K['pyld']}-{K['cpn']})/{K['pyld']}*"
+             f"((1+{K['pyld']}/{K['pcmp']})^({K['pcmp']}*({i}*{K['dt']}+{K['elm']}/12))-1)),"
              f"{K['prate']}),0)", N2)
         g(8, f"=IF(AND({i}>0,MOD({i},{K['ipay']})=0),"
-             f"100*{K['cpn']}*{K['ipay']}*{K['dt']},0)", N2)
+             f"100*{K['cpn']}*{K['ipaym']}/12,0)", N2)
         g(9, f"=IF({i}={K['n']},{K['red']},0)", N2)
         if i < n: g(10, forward_rate(CR, i*dt_, (i+1)*dt_), P2, AMB)
         g(11, (f"=MAX({L}$7,{L}$9)+{L}$8" if i == n else
@@ -1501,11 +1514,12 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
          f"=IF({Q(S8)}!{L}{R0+r}=0,0,{Q(S5)}!{L}{R0+r}/{Q(S8)}!{L}{R0+r})", N4)
 
     W = newsheet(S18, "⑱ 혼합할인율트리  구성비율 × 무위험 + (1−구성비율) × 위험",
+                 "이 칸을 직전 시점으로 할인할 때 쓰는 이자율이다. "
                  "지분 몫에는 무위험, 채권 몫에는 위험 선도이자율을 섞는다.",
                  S17, call_on=False)
     fill(W, lambda i, r, L, Lp, Ln:
-         f"={Q(S17)}!{L}{R0+r}*{L}$11+(1-{Q(S17)}!{L}{R0+r})*{L}$12"
-         if i < n else "=0", P2)
+         (f"={Q(S17)}!{L}{R0+r}*{Lp}$11+(1-{Q(S17)}!{L}{R0+r})*{Lp}$12"
+          if i > 0 else "=0"), P2)
 
     W = newsheet(S19, "⑲ 콜 페이오프트리  MAX(전환사채 가치 − 매도청구금액, 0)",
                  "매도청구 행사기간에만 값이 생긴다. 기초자산은 ⑧ 이다.", S8)
@@ -1517,8 +1531,8 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
                  f"{S18} · {S19} · 다음 열 {S20}")
     fill(W, lambda i, r, L, Lp, Ln: (f"={Q(S19)}!{L}{R0+r}" if i == n else
          f"=MAX({Q(S19)}!{L}{R0+r},"
-         f"{Ln}{R0+r}*{Ln}$16*EXP(-{Q(S18)}!{Ln}{R0+r}*{K['dt']})"
-         f"+{Ln}{R0+r+1}*{Ln}$17*EXP(-{Q(S18)}!{Ln}{R0+r+1}*{K['dt']}))"))
+         f"{Ln}{R0+r}*{L}$16*EXP(-{Q(S18)}!{Ln}{R0+r}*{K['dt']})"
+         f"+{Ln}{R0+r+1}*{L}$17*EXP(-{Q(S18)}!{Ln}{R0+r+1}*{K['dt']}))"))
     put(W, R0+n+3, 2, "매도청구권 (한도 반영 전, t=0)", bold=True)
     put(W, R0+n+3, 3, f"=C{R0}", bold=True, fmt=N2, align="right")
 
