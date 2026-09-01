@@ -1189,6 +1189,7 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         ("상향 조정 (1/0)", "up", 1 if tm.rfx_mode == 2 else 0, N0, True),
         ("조정일 처리 (1/2/3)", "mth", max(1, tm.carry), N0, True),
         ("전환권 분류 (1 자본 / 0 부채)", "eqcls", 1 if tm.conv_class == "equity" else 0, N0, True),
+        ("매도청구권 평가방법", "kmeth", K_METHODS[tm.k_method], None, False),
         ("전자등록총액 (원)", "face", tm.face_total, N0, True),
         ("무위험 (연속, 평탄)", "rfc", RF(tm.T), P2, False)]
     ROWN = {key: 3+i for i, (_, key, _, _, _) in enumerate(spec)}
@@ -1328,7 +1329,7 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
 
     W = newsheet(S5, "⑤ 지분가치트리",
                  "전환이면 전환가치, 상환이면 0, 보유면 다음 열을 무위험이자율로 할인.",
-                 f"{S4} · {S9} · 다음 열 {S5}")
+                 f"{S4} · {S9} · 다음 열 {S5}", call_on=False)
     fill(W, lambda i, r, L, Lp, Ln: (
         f'=IF({Q(S9)}!{L}{R0+r}="전환",{Q(S4)}!{L}{R0+r},0)' if i == n else
         f'=IF({Q(S9)}!{L}{R0+r}="전환",{Q(S4)}!{L}{R0+r},'
@@ -1337,7 +1338,7 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
 
     W = newsheet(S6, "⑥ 부채가치트리",
                  "전환이면 0, 상환이면 그 금액, 보유면 다음 열을 위험 선도이자율로 할인.",
-                 f"{S9} · 다음 열 {S6}")
+                 f"{S9} · 다음 열 {S6}", call_on=False)
     fill(W, lambda i, r, L, Lp, Ln: (
         f'=IF({Q(S9)}!{L}{R0+r}="전환",0,MAX({L}$7,{L}$10))' if i == n else
         f'=IF({Q(S9)}!{L}{R0+r}="상환P",{L}$7,IF({Q(S9)}!{L}{R0+r}="상환C",{L}$8,'
@@ -1346,7 +1347,7 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
 
     W = newsheet(S7, "⑦ 보유가치트리",
                  "지분은 무위험, 부채는 위험 선도이자율로 따로 할인해 더한다. 이것이 TF다.",
-                 f"다음 열 {S5} · {S6}")
+                 f"다음 열 {S5} · {S6}", call_on=False)
     fill(W, lambda i, r, L, Lp, Ln: (f"={L}$10" if i == n else
          f"=({Q(S5)}!{Ln}{R0+r}*{Ln}$16+{Q(S5)}!{Ln}{R0+r+1}*{Ln}$17)"
          f"*EXP(-{Ln}$11*{K['dt']})"
@@ -1354,17 +1355,17 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
          f"*EXP(-{Ln}$12*{K['dt']})+{L}$9"))
 
     W = newsheet(S8, "⑧ 금융상품가치트리",
-                 "네 갈래 중 최적. 매도청구 기간에는 발행자가 상한을 씌운다.", f"{S4} · {S7}")
+                 "70% 트랜치 — 매도청구권이 걸리지 않는다. 콜은 ⑮에서만 반영한다.",
+                 f"{S4} · {S7}", call_on=False)
     fill(W, lambda i, r, L, Lp, Ln:
-         f"=IF({L}$5=1,MAX(MIN({Q(S7)}!{L}{R0+r},{L}$8),{Q(S4)}!{L}{R0+r},{L}$7),"
-         f"MAX({Q(S7)}!{L}{R0+r},{Q(S4)}!{L}{R0+r},{L}$7))")
+         f"=MAX({Q(S7)}!{L}{R0+r},{Q(S4)}!{L}{R0+r},{L}$7)")
 
-    W = newsheet(S9, "⑨ 의사결정트리", "금융상품가치가 무엇과 같은지로 판정한다.",
-                 f"{S4} · {S8}")
+    W = newsheet(S9, "⑨ 의사결정트리",
+                 "금융상품가치가 무엇과 같은지로 판정한다. 70% 트랜치라 상환C 는 없다.",
+                 f"{S4} · {S8}", call_on=False)
     fill(W, lambda i, r, L, Lp, Ln:
          f'=IF({Q(S8)}!{L}{R0+r}={Q(S4)}!{L}{R0+r},"전환",'
-         f'IF({Q(S8)}!{L}{R0+r}={L}$7,"상환P",'
-         f'IF({Q(S8)}!{L}{R0+r}={L}$8,"상환C","보유")))', txt=True)
+         f'IF({Q(S8)}!{L}{R0+r}={L}$7,"상환P","보유"))', txt=True)
 
     W = newsheet(S10, "⑩ 주계약가치트리  옵션이 전혀 없는 순수 사채",
                  "주가와 무관하므로 같은 열의 값이 모두 같다.", "가정")
@@ -1386,16 +1387,15 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
          f"={Q(S11)}!{L}{R0+r}*{L}$11+(1-{Q(S11)}!{L}{R0+r})*{L}$12", P2)
 
     W = newsheet(S13, "⑬ [GS] 보유가치트리",
-                 "다음 두 칸을 각 칸의 할인율로 따로 할인한다.", f"다음 열 {S12} · {S14}")
+                 "다음 두 칸을 각 칸의 할인율로 따로 할인한다.", f"다음 열 {S12} · {S14}", call_on=False)
     fill(W, lambda i, r, L, Lp, Ln: (f"={L}$10" if i == n else
          f"={Q(S14)}!{Ln}{R0+r}*{Ln}$16*EXP(-{Q(S12)}!{Ln}{R0+r}*{K['dt']})"
          f"+{Q(S14)}!{Ln}{R0+r+1}*{Ln}$17*EXP(-{Q(S12)}!{Ln}{R0+r+1}*{K['dt']})+{L}$9"))
 
     W = newsheet(S14, "⑭ [GS] 금융상품가치트리",
-                 "⑧과 같은 칸을 비교하면 모형 차이가 보인다.", f"{S4} · {S13}")
+                 "⑧과 같은 칸을 비교하면 모형 차이가 보인다.", f"{S4} · {S13}", call_on=False)
     fill(W, lambda i, r, L, Lp, Ln:
-         f"=IF({L}$5=1,MAX(MIN({Q(S13)}!{L}{R0+r},{L}$8),{Q(S4)}!{L}{R0+r},{L}$7),"
-         f"MAX({Q(S13)}!{L}{R0+r},{Q(S4)}!{L}{R0+r},{L}$7))")
+         f"=MAX({Q(S13)}!{L}{R0+r},{Q(S4)}!{L}{R0+r},{L}$7)")
 
     # ── 15 30% 트랜치 ──
     W = newsheet(S15, "⑮ 30% 트랜치  매도청구권이 걸리는 부분",
@@ -1498,7 +1498,7 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     items = [("주계약", f"={Q(S10)}!C{R0}"),
              ("부채요소 (사채 + 조기상환권)", f"={Q(S16)}!C13"),
              ("조기상환청구권", "=C14-C13"),
-             ("매도청구권자산", f"={K['cw']}*(C6-C8)"),
+             ("매도청구권자산 (유무가치비교법)", f"={K['cw']}*(C6-C8)"),
              ("전환권대가 (자본일 때)", f'=IF({K["eqcls"]}=1,100-C14+C16,"")'),
              ("복합내재파생상품 (부채일 때)", f'=IF({K["eqcls"]}=0,C6-C13,"")'),
              ("주계약 잔여 (부채일 때)", f'=IF({K["eqcls"]}=0,100+C16-C18,"")')]
@@ -1599,6 +1599,8 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
       ("", ""),
       ("주의", ""),
       ("상태확장", "수식 조서는 재결합 격자에서만 만들 수 있다. 앱이 경로가중치로 대체한다."),
+      ("매도청구권", "수식 조서는 유무가치비교법만 담는다. 옵션차익혼합할인법을 고른 경우 "
+                 "값 조서를 함께 보아야 한다."),
       ("검산", "결과 시트 3번을 먼저 보고 모두 적합인지 확인한다.")]
     r = 4
     for a2, b3 in ex:
@@ -2153,6 +2155,10 @@ with tabs[8]:
         if t.carry == 0 and t.rfx_mode > 0:
             st.warning("상태확장은 한 노드에 전환가격이 여럿이라 수식으로 펼 수 없습니다. "
                        "경로가중치로 대체해 만듭니다. 값이 조금 달라집니다.")
+        if t.k_method:
+            st.warning(f"매도청구권을 **{K_METHODS[t.k_method]}** 으로 고르셨지만, 수식 조서는 "
+                       "**유무가치비교법**으로 만들어집니다. 복합옵션 트리를 수식으로 펴는 것은 "
+                       "아직 넣지 않았습니다. 선택한 방법의 값은 **값 조서**에서 보십시오.")
     c1, c2 = st.columns([1, 2])
     if c1.button("조서 만들기", type="primary", use_container_width=True):
         try:
@@ -2163,6 +2169,7 @@ with tabs[8]:
                 else:
                     tf = Terms(**asdict(t))
                     if tf.carry == 0 and tf.rfx_mode > 0: tf.carry = 1
+                    tf.k_method = 0        # 수식 조서는 유무가치비교법만 담는다
                     ff, f0, f1, f2, fca, fconv = decompose(tf)
                     data = build_xlsx_formula(tf, ff, f0, f1, f2, fca, fconv, eir_table(tf, f0))
                     fn = f"CB평가조서_수식_{dt.date.today()}.xlsx"
