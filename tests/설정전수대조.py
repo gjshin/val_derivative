@@ -147,35 +147,61 @@ ROWS = [("적용 70% 트랜치", "C10", "b2"), ("적용 30% 트랜치", "C11", "
         ("매도청구권 적용값", "C22", "ca")]
 
 
-def main():
+def run_one(idx):
+    """케이스 하나를 재고 결과를 JSON 한 줄로 뱉는다. 별도 프로세스에서 돈다.
+
+    formulas 는 한 번 풀 때마다 메모리를 크게 물고 놓지 않아, 한 프로세스에서
+    수십 케이스를 이어 돌리면 죽는다. 그래서 케이스마다 프로세스를 새로 띄운다.
+    """
+    import json
     G = load_app()
+    lbl, over, why = CASES[idx]
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "wb.xlsx")
+        eng, res, acc = build(G, over, path)
+        got = solve(path, (res, acc))
+    out = {"lbl": lbl, "why": why, "ca": eng["ca"],
+           "vals": [got[res].get(c) for _, c, _ in ROWS],
+           "want": [eng[k] for _, _, k in ROWS],
+           "alloc": got[acc].get("C12"),
+           "dr": got[acc].get("C22"), "cr": got[acc].get("D22"),
+           "gap": "_gap" in over}
+    print("@@" + json.dumps(out), flush=True)
+    return 0
+
+
+def main():
+    import json, subprocess
     bad, dead, base = [], [], None
     print("%-22s %10s %10s %10s %10s %10s  %s"
           % ("설정", "70%", "30%", "주계약", "부채요소", "매도청구", "판정"))
-    for lbl, over, why in CASES:
-        with tempfile.TemporaryDirectory() as d:
-            path = os.path.join(d, "wb.xlsx")
-            eng, res, acc = build(G, over, path)
-            got = solve(path, (res, acc))
-        vals, ok = [], True
-        for nm, cell, key in ROWS:
-            have, want = got[res].get(cell), eng[key]
-            vals.append(have)
+    for idx in range(len(CASES)):
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), str(idx)],
+                           capture_output=True, text=True)
+        line = [x for x in r.stdout.splitlines() if x.startswith("@@")]
+        if not line:
+            lbl = CASES[idx][0]
+            bad.append(f"{lbl}: 계산 실패 — {r.stderr.strip().splitlines()[-1:] }")
+            print("%-22s %s" % (lbl, "★ 계산 실패"))
+            continue
+        o = json.loads(line[0][2:])
+        lbl, why, eng_ca = o["lbl"], o["why"], o["ca"]
+        vals, ok = o["vals"], True
+        for (nm, _, _), have, want in zip(ROWS, vals, o["want"]):
             if have is None or abs(have - want) > 1e-4:
                 ok = False
                 bad.append(f"{lbl} · {nm}: 조서 {have} · 엔진 {want:.4f}")
         # 배분 합계와 분개 대차도 매번 본다
-        A = got[acc]
-        if A.get("C12") is None or abs(A["C12"] - 100.0) > 1e-4:
-            ok = False; bad.append(f"{lbl} · 배분 합계: {A.get('C12')}")
-        if (A.get("C22") is None or A.get("D22") is None
-                or abs(A["C22"] - A["D22"]) > 1e-4
-                or abs(A["C22"] - (100 + eng["ca"])) > 1e-4):
-            ok = False; bad.append(f"{lbl} · 분개 대차: {A.get('C22')} / {A.get('D22')}")
+        if o["alloc"] is None or abs(o["alloc"] - 100.0) > 1e-4:
+            ok = False; bad.append(f"{lbl} · 배분 합계: {o['alloc']}")
+        if (o["dr"] is None or o["cr"] is None
+                or abs(o["dr"] - o["cr"]) > 1e-4
+                or abs(o["dr"] - (100 + eng_ca)) > 1e-4):
+            ok = False; bad.append(f"{lbl} · 분개 대차: {o['dr']} / {o['cr']}")
         if base is None:
             base = vals
             moved = True
-        elif "_gap" in over:
+        elif o["gap"]:
             moved = True                       # 격자가 달라 기준선 비교가 의미 없다
         else:
             moved = any(v is not None and b is not None and abs(v - b) > 1e-6
@@ -199,4 +225,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run_one(int(sys.argv[1])) if len(sys.argv) > 1 else main())

@@ -554,6 +554,8 @@ def validate(tm: Terms):
     if tm.rfx_mode > 0 and round(tm.rfx_cyc*tm.n/(tm.T*12)) < 1:
         w.append("조정 주기가 노드 간격보다 짧습니다. 노드를 늘리십시오.")
     if round(tm.p_f*tm.n/(tm.T*12)) < 1: w.append("조기상환 주기가 노드 간격보다 짧습니다.")
+    if tm.k_w > 0 and round(tm.k_f*tm.n/(tm.T*12)) < 1:
+        w.append("매도청구 주기가 노드 간격보다 짧습니다.")
     if tm.sig <= 0.01: w.append("변동성이 지나치게 낮습니다.")
     if tm.sig > 2: w.append("변동성이 200%를 넘습니다. 단위를 확인하십시오.")
     if tm.carry == 0 and tm.rfx_mode > 0 and tm.n > 120:

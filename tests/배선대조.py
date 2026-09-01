@@ -145,6 +145,53 @@ def main():
             marks.append("%s %s" % (k, "OK" if ok else "★"))
         print("   경과 %2.0f개월  n=%2d  %s" % (t.elapsed_m, n, " · ".join(marks)))
 
+    print("\n3. 값 조서의 금액 행이 엔진 산식과 같은가")
+    for lbl, kw in (("무이표", {}),
+                    ("표면 2% · 보장 7% 복리", dict(cpn=.02, ytm=.07,
+                                                 p_mode="accrue", p_yield=.07)),
+                    ("중간평가 12개월", dict(d_base="2026-03-31", cpn=.02,
+                                        p_mode="accrue", p_yield=.07)),
+                    ("중간평가 18개월 · 반기", dict(d_base="2026-09-30", cpn=.03,
+                                             ipay=6., ytm=.07, p_mode="accrue",
+                                             p_yield=.07, k_prem=.05))):
+        t = terms(G, **kw)
+        n = t.n; mper = n/(t.T*12); dt_ = t.T/n; ey = t.elapsed_m/12
+        stp = lambda mth: int(round((mth-t.elapsed_m)*mper))
+        per = lambda mth: max(1, int(round(mth*mper)))
+        ar = G["accrue_rate"]
+        inset = lambda i, a, b, fr: stp(a) <= i <= stp(b) and (i-stp(a)) % per(fr) == 0
+        full, b0, b1, b2, ca, conv = G["decompose"](t)
+        W = openpyxl.load_workbook(io.BytesIO(
+            G["build_xlsx"](t, full, b0, b1, b2, ca, conv,
+                            G["eir_table"](t, b0))))["01 주가"]
+        worst = [("", 0.0)]
+        for i in range(n+1):
+            # 조기상환금액
+            want = (0.0 if not inset(i, t.p_s, t.p_e, t.p_f) else
+                    (100*(1+ar(i*dt_+ey, t.p_yield, t.cpn, t.p_cmp))
+                     if t.p_mode == "accrue" else t.p_rate))
+            got = W.cell(7, 3+i).value or 0.0
+            if abs(got-want) > worst[0][1]: worst = [("조기상환금액", abs(got-want))]
+            # 매도청구금액
+            want = (999999 if not inset(i, t.k_s, t.k_e, t.k_f) else
+                    100*(1+ar(i*dt_+ey, t.k_prem, t.cpn, 1)))
+            got = W.cell(8, 3+i).value or 0.0
+            if abs(got-want) > worst[0][1]: worst = [("매도청구금액", abs(got-want))]
+            # 쿠폰
+            want = 100*t.cpn*t.ipay/12 if (t.cpn > 0 and i > 0
+                                           and i % per(t.ipay) == 0) else 0.0
+            got = W.cell(9, 3+i).value or 0.0
+            if abs(got-want) > worst[0][1]: worst = [("쿠폰", abs(got-want))]
+            # 만기상환
+            want = 100*(1+ar(t.T+ey, t.ytm, t.cpn, t.ytm_cmp)) if i == n else 0.0
+            got = W.cell(10, 3+i).value or 0.0
+            if abs(got-want) > worst[0][1]: worst = [("만기상환", abs(got-want))]
+        nm2, gap = worst[0]
+        ok = gap < 1e-3
+        if not ok: bad += 1
+        print("   %-22s n=%2d  최대 차이 %s %.6f  %s"
+              % (lbl, n, nm2 or "—", gap, "OK" if ok else "★"))
+
     print("\n" + ("배선 이상 없음" if bad == 0 else "★ %d건" % bad))
     return 0 if bad == 0 else 1
 
