@@ -305,10 +305,14 @@ def engine(tm: Terms, conv=True, put=True, call=False, conv_start=None):
             KK = K if exact else Kg[n][j]
             cv = 100*S(n, j)/KK if conv_ok(n) else 0.0
             pv = put_a(n)
-            if cv >= max(pv, red) and cv > 0:
+            # 만기에도 이자 지급일이면 이자를 함께 받는다 (책 5-7 만기 현금흐름).
+            # 전환을 택하면 주식을 받으므로 중간 노드와 같이 이자는 사라진다.
+            cm = cpn_amt if is_pay(n) else 0.0
+            cash = max(pv, red) + cm
+            if cv >= max(cash, 0.0) and cv > 0:
                 o = dict(E=cv, B=0.0, V=cv, P=1.0, kind="conv", hold=red, cv=cv, K=KK)
             else:
-                o = dict(E=0.0, B=max(pv, red), V=max(pv, red), P=0.0, kind="mat",
+                o = dict(E=0.0, B=cash, V=cash, P=0.0, kind="mat",
                          hold=red, cv=cv, K=KK)
         else:
             def nk(s):
@@ -1196,7 +1200,7 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         ("상향 조정 (1/0)", "up", 1 if tm.rfx_mode == 2 else 0, N0, True),
         ("조정일 처리 (1/2/3)", "mth", max(1, tm.carry), N0, True),
         ("전환권 분류 (1 자본 / 0 부채)", "eqcls", 1 if tm.conv_class == "equity" else 0, N0, True),
-        ("매도청구권 평가방법", "kmeth", K_METHODS[tm.k_method], None, False),
+        ("매도청구권 평가방법 (0 유무가치 / 1 혼합할인율)", "kmeth", min(tm.k_method, 1), N0, True),
         ("전자등록총액 (원)", "face", tm.face_total, N0, True),
         ("무위험 (연속, 평탄)", "rfc", RF(tm.T), P2, False)]
     ROWN = {key: 3+i for i, (_, key, _, _, _) in enumerate(spec)}
@@ -1283,6 +1287,8 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     S8, S9, S10 = "08 금융상품가치", "09 의사결정", "10 주계약가치"
     S11, S12, S13, S14 = "11 GS 전환확률", "12 GS 할인율", "13 GS 보유가치", "14 GS 금융상품가치"
     S15, S16 = "15 30% 트랜치", "16 부채요소"
+    S17, S18 = "17 구성비율", "18 혼합할인율"
+    S19, S20 = "19 콜 페이오프", "20 매도청구권가치"
 
     # ── 01 주가 ──
     W = newsheet(S1, "① 주가트리",
@@ -1347,7 +1353,7 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
                  "전환이면 0, 상환이면 그 금액, 보유면 다음 열을 위험 선도이자율로 할인.",
                  f"{S9} · 다음 열 {S6}", call_on=False)
     fill(W, lambda i, r, L, Lp, Ln: (
-        f'=IF({Q(S9)}!{L}{R0+r}="전환",0,MAX({L}$7,{L}$10))' if i == n else
+        f'=IF({Q(S9)}!{L}{R0+r}="전환",0,MAX({L}$7,{L}$10)+{L}$9)' if i == n else
         f'=IF({Q(S9)}!{L}{R0+r}="상환P",{L}$7,IF({Q(S9)}!{L}{R0+r}="상환C",{L}$8,'
         f'IF({Q(S9)}!{L}{R0+r}="전환",0,'
         f'({Ln}{R0+r}*{Ln}$16+{Ln}{R0+r+1}*{Ln}$17)*EXP(-{Ln}$12*{K["dt"]})+{L}$9)))'))
@@ -1355,7 +1361,7 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     W = newsheet(S7, "⑦ 보유가치트리",
                  "지분은 무위험, 부채는 위험 선도이자율로 따로 할인해 더한다. 이것이 TF다.",
                  f"다음 열 {S5} · {S6}", call_on=False)
-    fill(W, lambda i, r, L, Lp, Ln: (f"={L}$10" if i == n else
+    fill(W, lambda i, r, L, Lp, Ln: (f"={L}$10+{L}$9" if i == n else
          f"=({Q(S5)}!{Ln}{R0+r}*{Ln}$16+{Q(S5)}!{Ln}{R0+r+1}*{Ln}$17)"
          f"*EXP(-{Ln}$11*{K['dt']})"
          f"+({Q(S6)}!{Ln}{R0+r}*{Ln}$16+{Q(S6)}!{Ln}{R0+r+1}*{Ln}$17)"
@@ -1365,7 +1371,8 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
                  "70% 트랜치 — 매도청구권이 걸리지 않는다. 콜은 ⑮에서만 반영한다.",
                  f"{S4} · {S7}", call_on=False)
     fill(W, lambda i, r, L, Lp, Ln:
-         f"=MAX({Q(S7)}!{L}{R0+r},{Q(S4)}!{L}{R0+r},{L}$7)")
+         f"=MAX({Q(S7)}!{L}{R0+r},{Q(S4)}!{L}{R0+r},{L}$7"
+         + (f"+{L}$9)" if i == n else ")"))
 
     W = newsheet(S9, "⑨ 의사결정트리",
                  "금융상품가치가 무엇과 같은지로 판정한다. 70% 트랜치라 상환C 는 없다.",
@@ -1376,7 +1383,7 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
 
     W = newsheet(S10, "⑩ 주계약가치트리  옵션이 전혀 없는 순수 사채",
                  "주가와 무관하므로 같은 열의 값이 모두 같다.", "가정")
-    fill(W, lambda i, r, L, Lp, Ln: (f"={L}$10" if i == n else
+    fill(W, lambda i, r, L, Lp, Ln: (f"={L}$10+{L}$9" if i == n else
          f"=({Ln}{R0+r}*{Ln}$16+{Ln}{R0+r+1}*{Ln}$17)*EXP(-{Ln}$12*{K['dt']})"
          f"+{L}$9+{L}$10"))
 
@@ -1395,14 +1402,15 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
 
     W = newsheet(S13, "⑬ [GS] 보유가치트리",
                  "다음 두 칸을 각 칸의 할인율로 따로 할인한다.", f"다음 열 {S12} · {S14}", call_on=False)
-    fill(W, lambda i, r, L, Lp, Ln: (f"={L}$10" if i == n else
+    fill(W, lambda i, r, L, Lp, Ln: (f"={L}$10+{L}$9" if i == n else
          f"={Q(S14)}!{Ln}{R0+r}*{Ln}$16*EXP(-{Q(S12)}!{Ln}{R0+r}*{K['dt']})"
          f"+{Q(S14)}!{Ln}{R0+r+1}*{Ln}$17*EXP(-{Q(S12)}!{Ln}{R0+r+1}*{K['dt']})+{L}$9"))
 
     W = newsheet(S14, "⑭ [GS] 금융상품가치트리",
                  "⑧과 같은 칸을 비교하면 모형 차이가 보인다.", f"{S4} · {S13}", call_on=False)
     fill(W, lambda i, r, L, Lp, Ln:
-         f"=MAX({Q(S13)}!{L}{R0+r},{Q(S4)}!{L}{R0+r},{L}$7)")
+         f"=MAX({Q(S13)}!{L}{R0+r},{Q(S4)}!{L}{R0+r},{L}$7"
+         + (f"+{L}$9)" if i == n else ")"))
 
     # ── 15 30% 트랜치 ──
     W = newsheet(S15, "⑮ 30% 트랜치  매도청구권이 걸리는 부분",
@@ -1432,12 +1440,12 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
                     fmt=(None if tx else fm), size=8, align=("center" if tx else "right"))
             p(c1, f"=IF({L}$3=1,{Q(S1)}!{L}{R0+r}*{Q(S3)}!{L}{R0+r},0)")
             if i == n:
-                p(c5, f"=MAX({L}{c1+1+r},{L}$7,{L}$10)")
+                p(c5, f"=MAX({L}{c1+1+r},MAX({L}$7,{L}$10)+{L}$9)")
                 p(c6, f'=IF({L}{c5+1+r}={L}{c1+1+r},"전환",'
                       f'IF({L}{c5+1+r}={L}$7,"상환P","만기상환"))', tx=True)
                 p(c2, f'=IF({L}{c6+1+r}="전환",{L}{c1+1+r},0)')
-                p(c3, f'=IF({L}{c6+1+r}="전환",0,MAX({L}$7,{L}$10))')
-                p(c4, f"={L}$10")
+                p(c3, f'=IF({L}{c6+1+r}="전환",0,MAX({L}$7,{L}$10)+{L}$9)')
+                p(c4, f"={L}$10+{L}$9")
                 continue
             e = f"({Ln}{c2+1+r}*{Ln}$16+{Ln}{c2+2+r}*{Ln}$17)*EXP(-{Ln}$11*{K['dt']})"
             b = f"({Ln}{c3+1+r}*{Ln}$16+{Ln}{c3+2+r}*{Ln}$17)*EXP(-{Ln}$12*{K['dt']})"
@@ -1479,10 +1487,40 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
              f"100*{K['cpn']}*{K['ipay']}*{K['dt']},0)", N2)
         g(9, f"=IF({i}={K['n']},{K['red']},0)", N2)
         if i < n: g(10, forward_rate(CR, i*dt_, (i+1)*dt_), P2, AMB)
-        g(11, (f"=MAX({L}$7,{L}$9)" if i == n else
+        g(11, (f"=MAX({L}$7,{L}$9)+{L}$8" if i == n else
                f"=MAX({L}$7,{Ln}11*EXP(-{L}$10*{K['dt']})+{L}$8)"), N2)
     put(D, 13, 2, "부채요소 (t=0)", bold=True)
     put(D, 13, 3, "=C11", bold=True, fmt=N2, align="right")
+
+    # ── 17~20 옵션차익혼합할인법 ──
+    # 제3자 지정 가능 콜옵션은 전환사채를 기초자산으로 하는 복합옵션이다.
+    # 기초자산은 콜과 부속조항(의무보유)을 뺀 ⑧ 이다 (책 4.4.3, 부속예제 4-4).
+    W = newsheet(S17, "⑰ 구성비율트리  지분 몫 ÷ 전환사채 가치",
+                 "노드 가치 중 주식에서 온 몫의 비율이다.", f"{S5} · {S8}", call_on=False)
+    fill(W, lambda i, r, L, Lp, Ln:
+         f"=IF({Q(S8)}!{L}{R0+r}=0,0,{Q(S5)}!{L}{R0+r}/{Q(S8)}!{L}{R0+r})", N4)
+
+    W = newsheet(S18, "⑱ 혼합할인율트리  구성비율 × 무위험 + (1−구성비율) × 위험",
+                 "지분 몫에는 무위험, 채권 몫에는 위험 선도이자율을 섞는다.",
+                 S17, call_on=False)
+    fill(W, lambda i, r, L, Lp, Ln:
+         f"={Q(S17)}!{L}{R0+r}*{L}$11+(1-{Q(S17)}!{L}{R0+r})*{L}$12"
+         if i < n else "=0", P2)
+
+    W = newsheet(S19, "⑲ 콜 페이오프트리  MAX(전환사채 가치 − 매도청구금액, 0)",
+                 "매도청구 행사기간에만 값이 생긴다. 기초자산은 ⑧ 이다.", S8)
+    fill(W, lambda i, r, L, Lp, Ln:
+         f"=IF({L}$5=1,MAX({Q(S8)}!{L}{R0+r}-{L}$8,0),0)")
+
+    W = newsheet(S20, "⑳ 매도청구권가치트리  미국형 복합옵션",
+                 "자식의 구성비율로 섞은 할인율로 자식을 각각 할인한다.",
+                 f"{S18} · {S19} · 다음 열 {S20}")
+    fill(W, lambda i, r, L, Lp, Ln: (f"={Q(S19)}!{L}{R0+r}" if i == n else
+         f"=MAX({Q(S19)}!{L}{R0+r},"
+         f"{Ln}{R0+r}*{Ln}$16*EXP(-{Q(S18)}!{Ln}{R0+r}*{K['dt']})"
+         f"+{Ln}{R0+r+1}*{Ln}$17*EXP(-{Q(S18)}!{Ln}{R0+r+1}*{K['dt']}))"))
+    put(W, R0+n+3, 2, "매도청구권 (한도 반영 전, t=0)", bold=True)
+    put(W, R0+n+3, 3, f"=C{R0}", bold=True, fmt=N2, align="right")
 
     # ── 결과 ──
     R = wb.create_sheet("결과"); R.sheet_view.showGridLines = False
@@ -1505,30 +1543,33 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     items = [("주계약", f"={Q(S10)}!C{R0}"),
              ("부채요소 (사채 + 조기상환권)", f"={Q(S16)}!C13"),
              ("조기상환청구권", "=C14-C13"),
-             ("매도청구권자산 (유무가치비교법)", f"={K['cw']}*(C6-C8)"),
-             ("전환권대가 (자본일 때)", f'=IF({K["eqcls"]}=1,100-C14+C16,"")'),
+             ("매도청구권 · 유무가치비교법", f"={K['cw']}*(C6-C8)"),
+             ("매도청구권 · 옵션차익혼합할인법", f"={K['cw']}*{Q(S20)}!C{R0+n+3}"),
+             ("매도청구권자산 (적용값)",
+              f"=IF({K['kmeth']}=0,C16,C17)"),
+             ("전환권대가 (자본일 때)", f'=IF({K["eqcls"]}=1,100-C14+C18,"")'),
              ("복합내재파생상품 (부채일 때)", f'=IF({K["eqcls"]}=0,C6-C13,"")'),
-             ("주계약 잔여 (부채일 때)", f'=IF({K["eqcls"]}=0,100+C16-C18,"")')]
+             ("주계약 잔여 (부채일 때)", f'=IF({K["eqcls"]}=0,100+C18-C20,"")')]
     for i, (nm, fx) in enumerate(items):
         r = 13+i
         put(R, r, 2, nm, bold=True, border=True)
         put(R, r, 3, fx, bold=True, fmt=N2, align="right", border=True)
         put(R, r, 4, f'=IF(ISNUMBER(C{r}),C{r}/100*{K["face"]},"")',
             fmt=N0, align="right", border=True)
-    sec(R, 21, "3. 검산", span=5)
+    sec(R, 23, "3. 검산", span=5)
     for i, (nm, fx, jd) in enumerate([
-            ("위험중립가중치 q", f"={K['q']}", '=IF(AND(C22>0,C22<1),"적합","확인 필요")'),
+            ("위험중립가중치 q", f"={K['q']}", '=IF(AND(C24>0,C24<1),"적합","확인 필요")'),
             ("도달확률 합계 (마지막 열)",
              f"=SUM(도달확률!{gl(3+n)}5:{gl(3+n)}{5+n})",
-             '=IF(ABS(C23-1)<0.0001,"적합","확인 필요")'),
-            ("전체 ≥ 주계약", "=C6-C13", '=IF(C24>=0,"적합","확인 필요")'),
+             '=IF(ABS(C25-1)<0.0001,"적합","확인 필요")'),
+            ("전체 ≥ 주계약", "=C6-C13", '=IF(C26>=0,"적합","확인 필요")'),
             ("배분 합계 = 100",
-             f'=IF({K["eqcls"]}=1,C13+C15-C16+C17,C19+C18-C16)',
-             '=IF(ABS(C25-100)<0.01,"적합","확인 필요")')]):
-        put(R, 22+i, 2, nm, border=True)
-        put(R, 22+i, 3, fx, fmt=N4, align="right", border=True)
-        put(R, 22+i, 5, jd, align="center", border=True)
-    put(R, 27, 2, "주황색 숫자만 값이다. 선도이자율은 부트스트래핑 결과라 엑셀에서 재현하지 않는다.",
+             f'=IF({K["eqcls"]}=1,C13+C15-C18+C19,C21+C20-C18)',
+             '=IF(ABS(C27-100)<0.01,"적합","확인 필요")')]):
+        put(R, 24+i, 2, nm, border=True)
+        put(R, 24+i, 3, fx, fmt=N4, align="right", border=True)
+        put(R, 24+i, 5, jd, align="center", border=True)
+    put(R, 29, 2, "주황색 숫자만 값이다. 선도이자율은 부트스트래핑 결과라 엑셀에서 재현하지 않는다.",
         color=AMB, size=9)
 
     # ── 회계처리 ──
@@ -1545,11 +1586,11 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     sec(E, 5, "1. 최초 인식 배분", span=5)
     for i, h in enumerate(["항목", "100 기준", "전액 기준 (원)"]):
         put(E, 6, 2+i, h, bold=True, fill=LIGHT, align="center", border=True, size=9)
-    al2 = [("주계약", f'=IF({K["eqcls"]}=1,결과!C13,결과!C19)'),
+    al2 = [("주계약", f'=IF({K["eqcls"]}=1,결과!C13,결과!C21)'),
            ("조기상환청구권 · 파생상품부채", f'=IF({K["eqcls"]}=1,결과!C15,"")'),
-           ("내재파생상품 · 파생상품부채", f'=IF({K["eqcls"]}=0,결과!C18,"")'),
-           ("매도청구권 · 파생상품자산", "=-결과!C16"),
-           ("전환권대가 · 자본", f'=IF({K["eqcls"]}=1,결과!C17,"")')]
+           ("복합내재파생상품 · 파생상품부채", f'=IF({K["eqcls"]}=0,결과!C20,"")'),
+           ("매도청구권 · 파생상품자산", "=-결과!C18"),
+           ("전환권대가 · 자본", f'=IF({K["eqcls"]}=1,결과!C19,"")')]
     for i, (nm, fx) in enumerate(al2):
         r = 7+i
         put(E, r, 2, nm, border=True)
@@ -1562,11 +1603,11 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     sec(E, 14, "2. 분개", span=5)
     for i, h in enumerate(["계정", "차변 (100)", "대변 (100)", "차변 (원)", "대변 (원)"]):
         put(E, 15, 2+i, h, bold=True, fill=LIGHT, align="center", border=True, size=9)
-    je2 = [("현금", "=100", None), ("파생상품자산 (매도청구권)", "=결과!C16", None),
-           ("　전환사채 (주계약)", None, f'=IF({K["eqcls"]}=1,결과!C13,결과!C19)'),
+    je2 = [("현금", "=100", None), ("파생상품자산 (매도청구권)", "=결과!C18", None),
+           ("　전환사채 (주계약)", None, f'=IF({K["eqcls"]}=1,결과!C13,결과!C21)'),
            ("　파생상품부채 (조기상환청구권)", None, f'=IF({K["eqcls"]}=1,결과!C15,"")'),
-           ("　파생상품부채 (복합내재파생상품)", None, f'=IF({K["eqcls"]}=0,결과!C18,"")'),
-           ("　전환권대가 (자본)", None, f'=IF({K["eqcls"]}=1,결과!C17,"")')]
+           ("　파생상품부채 (복합내재파생상품)", None, f'=IF({K["eqcls"]}=0,결과!C20,"")'),
+           ("　전환권대가 (자본)", None, f'=IF({K["eqcls"]}=1,결과!C19,"")')]
     for i, (nm, dr, cr) in enumerate(je2):
         r = 16+i
         put(E, r, 2, nm, size=9, border=True)
@@ -1606,8 +1647,8 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
       ("", ""),
       ("주의", ""),
       ("상태확장", "수식 조서는 재결합 격자에서만 만들 수 있다. 앱이 경로가중치로 대체한다."),
-      ("매도청구권", "수식 조서는 유무가치비교법만 담는다. 옵션차익혼합할인법을 고른 경우 "
-                 "값 조서를 함께 보아야 한다."),
+      ("매도청구권", "⑰~⑳ 이 옵션차익혼합할인법이다. 결과 시트에 두 방법이 나란히 나오고, "
+                 "가정 시트의 평가방법 값으로 어느 쪽을 적용할지 고른다."),
       ("검산", "결과 시트 3번을 먼저 보고 모두 적합인지 확인한다.")]
     r = 4
     for a2, b3 in ex:
@@ -2162,10 +2203,6 @@ with tabs[8]:
         if t.carry == 0 and t.rfx_mode > 0:
             st.warning("상태확장은 한 노드에 전환가격이 여럿이라 수식으로 펼 수 없습니다. "
                        "경로가중치로 대체해 만듭니다. 값이 조금 달라집니다.")
-        if t.k_method:
-            st.warning(f"매도청구권을 **{K_METHODS[t.k_method]}** 으로 고르셨지만, 수식 조서는 "
-                       "**유무가치비교법**으로 만들어집니다. 복합옵션 트리를 수식으로 펴는 것은 "
-                       "아직 넣지 않았습니다. 선택한 방법의 값은 **값 조서**에서 보십시오.")
     c1, c2 = st.columns([1, 2])
     if c1.button("조서 만들기", type="primary", use_container_width=True):
         try:
@@ -2176,7 +2213,6 @@ with tabs[8]:
                 else:
                     tf = Terms(**asdict(t))
                     if tf.carry == 0 and tf.rfx_mode > 0: tf.carry = 1
-                    tf.k_method = 0        # 수식 조서는 유무가치비교법만 담는다
                     ff, f0, f1, f2, fca, fconv = decompose(tf)
                     data = build_xlsx_formula(tf, ff, f0, f1, f2, fca, fconv, eir_table(tf, f0))
                     fn = f"CB평가조서_수식_{dt.date.today()}.xlsx"
