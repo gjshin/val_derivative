@@ -33,6 +33,7 @@ class Terms:
     cpn: float = 0.0            # 표면이자율
     ipay: float = 3.0           # 이자 지급주기 (개월)
     ytm: float = 0.0            # 만기보장수익률
+    ytm_cmp: int = 4            # 만기보장수익률 복리 횟수 (분기)
     cv_s: float = 12.0          # 전환 시작 (개월)
     cv_e: float = 59.0
     rfx_mode: int = 2           # 0 없음 / 1 하향만 / 2 하향+상향
@@ -69,6 +70,20 @@ class Terms:
     px_adjusted: bool = True      # 수정주가 사용 여부
     rf_curve: list = field(default_factory=list)   # [(만기, 연이율)]
     cr_curve: list = field(default_factory=list)
+
+
+def accrue_rate(t_year: float, g: float, c: float, m: int) -> float:
+    """상환할증금률. 미지급 보장수익률을 매 회차 적립해 굴린 연금의 미래가치다.
+
+        Σ_{k=1..mt} ((g−c)/m)·(1+g/m)^(mt−k)  =  (g−c)/g · ((1+g/m)^(mt) − 1)
+
+    표면이자율 c 를 빼는 것은 그만큼 이미 현금으로 지급했기 때문이다.
+    c 가 0 이면 (1+g/m)^(mt) − 1 로 줄어 종전 산식과 같아진다.
+    """
+    if t_year <= 0: return 0.0
+    m = max(1, int(m))
+    if g <= 1e-12: return (g - c)*t_year        # g → 0 극한
+    return (g - c)/g * ((1 + g/m)**(m*t_year) - 1)
 
 
 def months_between(d1: dt.date, d2: dt.date) -> float:
@@ -231,17 +246,16 @@ def engine(tm: Terms, conv=True, put=True, call=False, conv_start=None):
     pay_per = max(1, int(round(tm.ipay*mper)))
     is_pay = lambda i: tm.cpn > 0 and i > 0 and i % pay_per == 0
     cpn_amt = 100*tm.cpn*tm.ipay/12
-    red = 100 + (tm.ytm - tm.cpn)*100*(T + ey)
+    red = 100*(1 + accrue_rate(T + ey, tm.ytm, tm.cpn, tm.ytm_cmp))
     S = lambda i, j: tm.S0 * u**j * d**(i-j)
     clip = lambda s: min(max(s, tm.floor, tm.par), tm.K0)
     def put_amt(i):
         """행사금액은 발행일부터 붙는다. 경과분을 더해 계산한다."""
         if tm.p_mode == "accrue":
-            eff = (1 + tm.p_yield/max(1, tm.p_cmp))**tm.p_cmp - 1
-            return 100*(1+eff)**(i*dt_ + ey)
+            return 100*(1 + accrue_rate(i*dt_ + ey, tm.p_yield, tm.cpn, tm.p_cmp))
         return tm.p_rate
     put_a = lambda i: put_amt(i) if (put and in_set(i, tm.p_s, tm.p_e, tm.p_f)) else 0.0
-    call_a = lambda i: (100*(1+tm.k_prem)**(i*dt_ + ey)
+    call_a = lambda i: (100*(1 + accrue_rate(i*dt_ + ey, tm.k_prem, tm.cpn, 1))
                         if (call and in_set(i, tm.k_s, tm.k_e, tm.k_f)) else math.inf)
     conv_ok = lambda i: conv and max(st_(cs), 0) <= i <= st_(tm.cv_e)
     exact = (tm.rfx_mode > 0 and tm.carry == 0)
@@ -478,7 +492,7 @@ def vol_from(prices, tdays=250, drop_outlier=True):
     removed, lo, hi = 0, None, None
     if drop_outlier:
         M = float(np.median(r)); mad = float(np.median(np.abs(r-M)))*1.4826
-        lo, hi = M-3*mad, M+3*mad
+        lo, hi = M-2.5*mad, M+2.5*mad   # 사례 5-2 와 같은 배수
         keep = (r >= lo) & (r <= hi); removed = int((~keep).sum()); r = r[keep]
     sd = float(np.std(r, ddof=1))
     return dict(daily=sd, annual=sd*math.sqrt(tdays), n=len(px)-1,
@@ -601,17 +615,17 @@ def build_xlsx(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     is_rfx = lambda i: tm.rfx_mode > 0 and i > 0 and stp(tm.rfx_cyc) > 0 and i % stp(tm.rfx_cyc) == 0
     REFIXC = {i for i in range(1, n+1) if is_rfx(i)}
     cpn_amt = 100*tm.cpn*tm.ipay/12
-    red = 100 + (tm.ytm-tm.cpn)*100*tm.T
+    ey = tm.elapsed_m/12                     # 경과 연수 — 행사금액은 발행일부터 붙는다
+    red = 100*(1 + accrue_rate(tm.T + ey, tm.ytm, tm.cpn, tm.ytm_cmp))
     def in_set(i, a, b, fr): return stp(a) <= i <= stp(b) and (i-stp(a)) % max(1, stp(fr)) == 0
     def put_amt(i):
         if not in_set(i, tm.p_s, tm.p_e, tm.p_f): return 0.0
         if tm.p_mode == "accrue":
-            eff = (1+tm.p_yield/max(1, tm.p_cmp))**tm.p_cmp - 1
-            return 100*(1+eff)**(i*dt_)
+            return 100*(1 + accrue_rate(i*dt_ + ey, tm.p_yield, tm.cpn, tm.p_cmp))
         return tm.p_rate
     def call_amt(i, on=True):
         if not on or not in_set(i, tm.k_s, tm.k_e, tm.k_f): return 999999
-        return 100*(1+tm.k_prem)**(i*dt_)
+        return 100*(1 + accrue_rate(i*dt_ + ey, tm.k_prem, tm.cpn, 1))
 
     HEAD = ["Date", "time-step", "Flag(전환)", "Flag(조기상환)", "Flag(매도청구)",
             "Flag(리픽싱)", "조기상환금액", "매도청구금액", "쿠폰", "만기상환",
@@ -1015,7 +1029,10 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         ("표면이자율", "cpn", tm.cpn, P2, True),
         ("이자 지급주기 (스텝)", "ipay", max(1, int(round(tm.ipay*mper))), N0, True),
         ("만기보장수익률", "ytm", tm.ytm, P2, True),
-        ("만기상환금액", "red", "@=100+(C{ytm}-C{cpn})*100*(C{T}+C{elm}/12)", N2, False),
+        ("만기보장 복리 횟수", "ycm", tm.ytm_cmp, N0, True),
+        ("만기상환금액", "red",
+         "@=IF(C{ytm}<=0,100+(C{ytm}-C{cpn})*100*(C{T}+C{elm}/12),"
+         "100*(1+(C{ytm}-C{cpn})/C{ytm}*((1+C{ytm}/C{ycm})^(C{ycm}*(C{T}+C{elm}/12))-1)))", N2, False),
         ("최저 조정가액", "flr", tm.floor, N2, True),
         ("액면가", "par", tm.par, N2, True),
         ("리픽싱 상한", "cap", "@=C{K0}", N2, False),
@@ -1531,11 +1548,14 @@ with st.sidebar:
         t.cpn = st.number_input("표면이자율 (%)", value=t.cpn*100, step=0.5)/100
         t.ipay = st.number_input("이자 지급주기 (개월)", value=float(t.ipay), step=1.0)
         t.ytm = st.number_input("만기보장수익률 (%)", value=t.ytm*100, step=0.1, format="%.4f")/100
+        t.ytm_cmp = int(st.number_input("만기보장 복리 횟수 (연)", value=int(t.ytm_cmp),
+                                        step=1, min_value=1, max_value=12,
+                                        help="공시 상환율이 분기복리면 4, 반기면 2."))
         t.face_total = st.number_input("전자등록총액 (원)", value=float(t.face_total),
                                        step=1e8, format="%.0f",
                                        help="회계처리 탭의 전액 기준 금액을 계산합니다.")
-        st.caption(f"만기상환금액 = {100+(t.ytm-t.cpn)*100*(t.T+t.elapsed_m/12):,.4f}   "
-                   "복리 조건이면 공시 상환율에서 역산해 넣으십시오.")
+        st.caption(f"만기상환금액 = {100*(1+accrue_rate(t.T+t.elapsed_m/12, t.ytm, t.cpn, t.ytm_cmp)):,.4f}   "
+                   "공시 만기상환율과 대조하십시오.")
 
     with st.expander("전환 · 조정"):
         st.caption("모두 **발행일 기준 개월**입니다. 계약서 그대로 넣으십시오.")
