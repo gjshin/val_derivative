@@ -24,6 +24,10 @@ CASES = [
     ("표면 8% · 매도청구 5%",
      dict(cpn=.08, ytm=.08, ipay=6., ytm_cmp=2, p_mode="accrue", p_yield=.08, k_prem=.05)),
     ("중간평가 · 한도 100%", dict(d_base="2025-12-31", k_w=1.0)),
+    ("GS", dict(model="GS")),
+    ("GS · 전환권 부채", dict(model="GS", conv_class="liability")),
+    ("GS · 옵션차익혼합할인법", dict(model="GS", k_method=1)),
+    ("전환권 부채", dict(conv_class="liability")),
 ]
 
 
@@ -63,47 +67,90 @@ def build(G, over, path):
                     c.value = f
     for o, nn in mp.items(): wb[o].title = nn
     wb.save(path)
+    al, _ = G["allocate"](t, full, b0, b1, b2, ca)
     return dict(b0=b0, b1=b1, b2=b2, gs=full["GS"], b3=b3, ca=ca, conv=conv,
-                ctp=t.k_w*ctp), mp["결과"]
+                ctp=t.k_w*ctp, al=al, eq=(t.conv_class == "equity")), \
+        mp["결과"], mp["회계처리"]
 
 
-def solve(path, res):
+def solve(path, sheets):
     import formulas
     xl = formulas.ExcelModel().loads(path).finish()
     sol = xl.calculate()
     base = os.path.basename(path).upper()
-    out = {}
+    out = {nm: {} for nm in sheets}
     for k, v in sol.items():
         ku = k.upper()
-        if ku.startswith(f"'[{base}]{res}'!"):
-            cell = ku.split("!")[-1]
-            try: out[cell] = float(v.value[0, 0])
-            except Exception: pass
+        for nm in sheets:
+            if ku.startswith(f"'[{base}]{nm}'!"):
+                cell = ku.split("!")[-1]
+                try: out[nm][cell] = float(v.value[0, 0])
+                except Exception: pass
     return out
 
 
 def main():
     G = load_app()
-    ROWS = [("70% 트랜치 TF", "C6", "b2"), ("70% 트랜치 GS", "C7", "gs"),
-            ("30% 트랜치 TF", "C8", "b3"), ("주계약", "C13", "b0"),
-            ("부채요소", "C14", "b1"), ("조기상환청구권", "C15", None),
-            ("매도청구권 유무가치", "C16", "ca"), ("매도청구권 옵션차익", "C17", "ctp"),
-            ("전환권대가", "C19", "conv")]
+    # C10·C11 이 적용 모형의 트랜치다. 엔진의 b2·b3 는 이미 모형을 반영한 값이다.
+    BASE = [("적용 70% 트랜치", "C10", "b2"), ("70% 트랜치 GS", "C7", "gs"),
+            ("적용 30% 트랜치", "C11", "b3"), ("주계약", "C16", "b0"),
+            ("부채요소", "C17", "b1"), ("조기상환청구권", "C18", None),
+            ("매도청구권 옵션차익", "C20", "ctp"),
+            ("매도청구권 적용값", "C21", "ca")]
     bad = 0
     for lbl, over in CASES:
+        # 전환권대가는 자본으로 분류할 때만 나온다. 부채면 조서가 빈칸이 맞다.
+        ROWS = BASE + ([("전환권대가", "C22", "conv")]
+                       if over.get("conv_class", "equity") == "equity" else [])
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "wb.xlsx")
-            eng, res = build(G, over, path)
-            got = solve(path, res)
+            eng, res, acc = build(G, over, path)
+            got = solve(path, (res, acc))
         print(f"\n[{lbl}]")
         for nm, cell, key in ROWS:
             want = eng[key] if key else eng["b1"] - eng["b0"]
-            have = got.get(cell)
+            have = got[res].get(cell)
             ok = have is not None and abs(have - want) < 1e-4
             if not ok: bad += 1
             print("   %-22s 조서 %11s · 엔진 %11.4f  %s"
                   % (nm, f"{have:.4f}" if have is not None else "없음", want,
                      "" if ok else "★"))
+        # 회계처리 — 배분표 C7:C11 과 분개 차·대변 합계
+        A = got[acc]
+        want_al = {k.split(" · ")[0].replace(" (잔여)", "").replace(
+                       " (옵션 없는 사채)", ""): v for k, v in eng["al"][:-1]}
+        have_al = {}
+        for r in range(7, 12):
+            v = A.get(f"C{r}")
+            if v is not None: have_al[r] = v
+        # 부호까지 포함해 합이 100 이 되어야 한다
+        tot = A.get("C12")
+        okt = tot is not None and abs(tot - 100.0) < 1e-4
+        if not okt: bad += 1
+        print("   %-22s 조서 %11s · 기준 %11.4f  %s"
+              % ("배분 합계", f"{tot:.4f}" if tot is not None else "없음", 100.0,
+                 "" if okt else "★"))
+        drr, crr = A.get("C22"), A.get("D22")
+        okj = (drr is not None and crr is not None
+               and abs(drr - crr) < 1e-4 and abs(drr - (100 + eng["ca"])) < 1e-4)
+        if not okj: bad += 1
+        print("   %-22s 차변 %11s · 대변 %11s · 기준 %10.4f  %s"
+              % ("분개 대차", f"{drr:.4f}" if drr is not None else "없음",
+                 f"{crr:.4f}" if crr is not None else "없음", 100 + eng["ca"],
+                 "" if okj else "★"))
+        # 배분 각 줄이 allocate() 와 같은가
+        rows_ord = ([("주계약", 7), ("조기상환청구권", 8), ("매도청구권", 10),
+                     ("전환권대가", 11)] if eng["eq"] else
+                    [("주계약", 7), ("복합내재파생상품", 9), ("매도청구권", 10)])
+        for nm, r in rows_ord:
+            want = want_al.get(nm)
+            if nm == "매도청구권": want = -eng["ca"]
+            have = have_al.get(r)
+            ok = have is not None and want is not None and abs(have - want) < 1e-4
+            if not ok: bad += 1
+            print("   %-22s 조서 %11s · 배분표 %9s  %s"
+                  % ("배분 · " + nm, f"{have:.4f}" if have is not None else "없음",
+                     f"{want:.4f}" if want is not None else "없음", "" if ok else "★"))
     print("\n" + ("모든 항목 일치" if bad == 0 else f"★ {bad}건 불일치"))
     return 0 if bad == 0 else 1
 
