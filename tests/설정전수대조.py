@@ -30,7 +30,7 @@ CASES = [
     ("전환가액 +20%", dict(K0=1023.6), None),
     # 일자·격자
     ("중간평가", dict(d_base="2026-03-31"), None),
-    ("노드 간격 2주", dict(gap_m=12/26), None),
+    ("노드를 촘촘히", dict(_gap=3.), None),
     # 이자
     ("표면 3%", dict(cpn=.03), None),
     ("이자 지급 반기", dict(cpn=.03, ipay=6.), None),
@@ -97,9 +97,11 @@ def terms(G, over):
     rf, cr = over.get("_rf", 0.), over.get("_cr", 0.)
     t.rf_curve = [(1, .0226+rf), (3, .0240+rf), (5, .0252+rf)]
     t.cr_curve = [(1, .1409+cr), (3, .1740+cr), (5, .1905+cr)]
-    t.carry = 1; t.gap_m = over.get("_gap", 6.0)   # 계산 시간을 줄인다. 구조는 같다.
     for k, v in over.items():
         if not k.startswith("_"): setattr(t, k, v)
+    # 계산 시간을 줄인다. 구조는 같다. gap_m 은 반드시 _gap 으로만 준다.
+    assert "gap_m" not in over, "격자는 _gap 으로 지정하십시오"
+    t.carry = 1; t.gap_m = over.get("_gap", 6.0)
     G["derive"](t)
     return t
 
