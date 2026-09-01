@@ -11,7 +11,7 @@
 시트 이름에 %와 한글이 있으면 formulas 가 깨져서 ASCII 로 바꾼 사본을 만들어 푼다.
 노드를 10개로 줄여 계산 시간을 줄인다. 구조가 같으므로 검증에는 충분하다.
 """
-import sys, os, types, json, warnings, tempfile
+import sys, os, re, types, json, warnings, tempfile
 warnings.filterwarnings("ignore")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -28,6 +28,8 @@ CASES = [
     ("GS · 전환권 부채", dict(model="GS", conv_class="liability")),
     ("GS · 옵션차익혼합할인법", dict(model="GS", k_method=1)),
     ("전환권 부채", dict(conv_class="liability")),
+    ("방법2 지분·부채 분리", dict(k_method=2)),
+    ("방법2 · 전환권 부채", dict(k_method=2, conv_class="liability")),
 ]
 
 
@@ -40,6 +42,17 @@ def load_app():
     return m.__dict__
 
 
+def _combin(f):
+    """formulas 는 COMBIN 을 구현하지 않는다. 인수가 모두 상수라 값으로 바꾼다.
+
+    조서 자체는 정상이다. 엑셀은 COMBIN 을 계산한다. 검사 도구의 한계라
+    여기서만 우회한다.
+    """
+    import math
+    return re.sub(r"COMBIN\((\d+),(\d+)\)",
+                  lambda m: repr(math.comb(int(m.group(1)), int(m.group(2)))), f)
+
+
 def build(G, over, path):
     T, derive, decompose = G["Terms"], G["derive"], G["decompose"]
     t = T(); t.rf_curve = [(1, .0226), (3, .0240), (5, .0252)]
@@ -50,7 +63,8 @@ def build(G, over, path):
     full, b0, b1, b2, ca, conv = decompose(t)
     b3 = G["pick"](G["engine"](t, conv=True, put=True, call=True,
                                conv_start=max(t.cv_s, t.k_lock)), t.model)
-    ctp = G["call_third_party"](t, full, 1)
+    ctp1 = G["call_third_party"](t, full, 1)
+    ctp2 = G["call_third_party"](t, full, 2)
     open(path, "wb").write(
         G["build_xlsx_formula"](t, full, b0, b1, b2, ca, conv, G["eir_table"](t, b0)))
 
@@ -64,12 +78,13 @@ def build(G, over, path):
                     f = c.value
                     for o, nn in sorted(mp.items(), key=lambda x: -len(x[0])):
                         f = f.replace(f"'{o}'!", f"{nn}!").replace(f"{o}!", f"{nn}!")
-                    c.value = f
+                    c.value = _combin(f)
     for o, nn in mp.items(): wb[o].title = nn
     wb.save(path)
     al, _ = G["allocate"](t, full, b0, b1, b2, ca)
     return dict(b0=b0, b1=b1, b2=b2, gs=full["GS"], b3=b3, ca=ca, conv=conv,
-                ctp=t.k_w*ctp, al=al, eq=(t.conv_class == "equity")), \
+                ctp1=t.k_w*ctp1, ctp2=t.k_w*ctp2,
+                al=al, eq=(t.conv_class == "equity")), \
         mp["결과"], mp["회계처리"]
 
 
@@ -95,12 +110,12 @@ def main():
     BASE = [("적용 70% 트랜치", "C10", "b2"), ("70% 트랜치 GS", "C7", "gs"),
             ("적용 30% 트랜치", "C11", "b3"), ("주계약", "C16", "b0"),
             ("부채요소", "C17", "b1"), ("조기상환청구권", "C18", None),
-            ("매도청구권 옵션차익", "C20", "ctp"),
-            ("매도청구권 적용값", "C21", "ca")]
+            ("매도청구권 방법1", "C20", "ctp1"), ("매도청구권 방법2", "C21", "ctp2"),
+            ("매도청구권 적용값", "C22", "ca")]
     bad = 0
     for lbl, over in CASES:
         # 전환권대가는 자본으로 분류할 때만 나온다. 부채면 조서가 빈칸이 맞다.
-        ROWS = BASE + ([("전환권대가", "C22", "conv")]
+        ROWS = BASE + ([("전환권대가", "C23", "conv")]
                        if over.get("conv_class", "equity") == "equity" else [])
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "wb.xlsx")
