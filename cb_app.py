@@ -3,7 +3,7 @@
 """전환사채 평가 — Streamlit
 
 실행
-    pip install streamlit numpy pandas matplotlib openpyxl pykrx yfinance
+    pip install streamlit numpy pandas matplotlib openpyxl yfinance
     streamlit run cb_app.py
 
 금액은 전자등록금액 100 기준이다.
@@ -51,9 +51,6 @@ class Terms:
     k_w: float = 0.30
     k_lock: float = 25.0
     sig: float = 0.4130
-    rf_flat: float = 0.028
-    cr_1y: float = 0.1464
-    cr_T: float = 0.1905
     model: str = "TF"
     conv_class: str = "equity"   # equity 전환권 자본 / liability 전환권 파생상품부채
     cmp_rf: int = 2              # 무위험 복리 횟수 (국고채 반기)
@@ -72,7 +69,6 @@ class Terms:
     px_adjusted: bool = True      # 수정주가 사용 여부
     rf_curve: list = field(default_factory=list)   # [(만기, 연이율)]
     cr_curve: list = field(default_factory=list)
-    use_curve: bool = False
 
 
 def months_between(d1: dt.date, d2: dt.date) -> float:
@@ -694,8 +690,7 @@ def build_xlsx(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         ("의무보유 전환지연 (개월)", tm.k_lock, N0)]),
       ("5. 시장 인풋", [("변동성 σ", tm.sig, P2),
         ("무위험 이표 (연 회)", tm.cmp_rf, N0), ("위험 이표 (연 회)", tm.cmp_cr, N0),
-        ("이자율 입력", ("만기수익률 곡선" if tm.y_type == "par" else "현물이자율 곡선")
-         if tm.use_curve else "직선 (1년·만기 두 점)", None),
+        ("이자율 입력", "만기수익률 곡선" if tm.y_type == "par" else "현물이자율 곡선", None),
         (f"{tm.T:.2f}년 무위험 (연속)", RF(tm.T), P2),
         (f"{tm.T:.2f}년 위험 (연속)", CR(tm.T), P2)]),
       ("6. 격자 파라미터", [("상승계수 u", full["u"], N4), ("하락계수 d", full["d"], N4),
@@ -787,7 +782,7 @@ def build_xlsx(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         fr = forward_rate(RF, i*dt_, (i+1)*dt_); fc = forward_rate(CR, i*dt_, (i+1)*dt_)
         for j2, v in enumerate([t_, RF(t_), fr, CR(t_), fc, fc-fr]):
             put(C, 6+k, 2+j2, v, fmt=(N2 if j2 == 0 else P2), align="right", border=True)
-    if tm.use_curve and tm.y_type == "par" and len(tm.cr_curve) >= 2:
+    if tm.y_type == "par" and len(tm.cr_curve) >= 2:
         sec(C, 16, "부트스트래핑 — 위험 곡선", span=6)
         for i, h in enumerate(["만기 (년)", "만기수익률", "할인계수", "현물 (연속)"]):
             put(C, 17, 2+i, h, bold=True, fill=LIGHT, align="center", border=True, size=9)
@@ -1621,7 +1616,6 @@ with st.sidebar:
     with st.expander("이자율", expanded=True):
         st.caption("무위험·위험 모두 만기수익률(YTM) 곡선을 넣습니다. "
                    "앱이 선형보간 → 부트스트래핑 → 선도이자율 순으로 처리합니다.")
-        t.use_curve = True
         unit = st.selectbox("만기 단위", ["auto", "month", "year"], index=0,
                             format_func=lambda x: {"auto": "자동 인식", "month": "개월",
                                                    "year": "년"}[x])
@@ -1781,7 +1775,7 @@ with tabs[2]:
                                    "위험 선도": "{:.2%}", "스프레드": "{:.2%}"}),
                  use_container_width=True, hide_index=True)
     st.line_chart(cdf.set_index("시점(년)")[["무위험 현물", "위험 현물", "위험 선도"]])
-    if t.use_curve and len(t.cr_curve) >= 2 and t.y_type == "par":
+    if len(t.cr_curve) >= 2 and t.y_type == "par":
         st.markdown("**부트스트래핑 과정**")
         dfs = bootstrap_df(t.cr_curve, t.T, t.cmp_cr)
         bt = pd.DataFrame([[d[0], _lin(t.cr_curve, d[0]), d[1], -math.log(d[1])/d[0]]
@@ -1892,8 +1886,8 @@ with tabs[6]:
     rows2 = []
     for dvv in (-0.05, -0.025, 0.0, 0.025, 0.05):
         tt = Terms(**asdict(t))
-        if tt.use_curve: tt.cr_curve = [(x, y+dvv) for x, y in t.cr_curve]
-        else: tt.cr_1y = t.cr_1y+dvv; tt.cr_T = t.cr_T+dvv
+        tt.cr_curve = [(x, y+dvv) for x, y in t.cr_curve]
+        tt.cr_curve_b = [(x, y+dvv) for x, y in t.cr_curve_b]
         rows2.append([dvv, pick(engine(tt, call=False), t.model)])
     base2 = rows2[2][1]
     st.dataframe(pd.DataFrame([[r[0], r[1], r[1]-base2] for r in rows2],

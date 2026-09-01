@@ -25,7 +25,7 @@ streamlit run cb_app.py
 3. Deploy 를 누르면 몇 분 뒤 주소가 나온다
 
 `requirements.txt` 를 저장소 루트에 두어야 필요한 패키지가 설치된다.
-`pykrx` 와 `yfinance` 가 설치되지 않는 환경이라면 두 줄을 빼도 앱은 돌아간다.
+`yfinance` 가 설치되지 않는 환경이라면 그 줄을 빼도 앱은 돌아간다.
 주가 자동 수집만 막히고 파일 붙여넣기는 그대로 된다.
 
 ## 화면
