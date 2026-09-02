@@ -1651,13 +1651,21 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
 
     if _need15:
         # ── 15 30% 트랜치 ──
+        # 고른 모형의 블록만 담는다. GS 블록은 TF 다섯 블록을 참조하지 않으므로
+        # 어느 쪽을 골라도 나머지 절반은 만들 필요가 없다.
         W = newsheet(S15, "⑮ 30% 트랜치  매도청구권이 걸리는 부분",
                      "의무보유 때문에 전환 시작이 늦다. 70%와의 차이가 매도청구권의 가치다. "
-                     "TF(가~바)와 GS(사~차)를 나란히 두어 결과 시트가 고른 모형을 가져간다.",
+                     + ("전환가치 뒤에 GS 네 블록을 둔다. 고른 모형이 GS 이기 때문이다."
+                        if _gs else
+                        "전환가치 뒤에 TF 다섯 블록을 둔다. 고른 모형이 TF 이기 때문이다."),
                      "가정", conv_cell=K["cv30"])
         HH = n+3
-        def blk(row, t):
-            sec(W, row-1, t, span=min(n+1, 14))
+        _bs = {"row": R0, "i": 0}
+        def blk(t):
+            _bs["row"] += HH
+            row = _bs["row"]
+            sec(W, row-1, f"{'가나다라마바'[_bs['i']]}  {t}", span=min(n+1, 14))
+            _bs["i"] += 1
             put(W, row, 2, "r ＼ 스텝", bold=True, size=8, fill=LIGHT, border=True, align="center")
             for i in range(n+1):
                 put(W, row, 3+i, i, bold=True, size=8, fmt=N0, align="center",
@@ -1666,69 +1674,82 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
                 put(W, row+1+r, 2, r, bold=True, size=8, fmt=N0, align="center",
                     fill=LIGHT, border=True)
             return row+1
-        c1 = blk(R0+HH,   "가  전환가치")
-        c2 = blk(R0+2*HH, "나  지분가치")
-        c3 = blk(R0+3*HH, "다  부채가치")
-        c4 = blk(R0+4*HH, "라  보유가치")
-        c5 = blk(R0+5*HH, "마  금융상품가치")
-        c6 = blk(R0+6*HH, "바  의사결정")
-        for i in range(n+1):
-            L = gl(3+i); Ln = gl(4+i) if i < n else None
-            for r in range(i+1):
-                p = lambda base, v, fm=N2, tx=False: put(W, base+1+r, 3+i, v,
-                        fmt=(None if tx else fm), size=8, align=("center" if tx else "right"))
-                p(c1, f"=IF({L}$3=1,{Q(S1)}!{L}{R0+r}*{Q(S3)}!{L}{R0+r},0)")
-                if i == n:
-                    p(c5, f"=MAX({L}{c1+1+r},MAX({L}$7,{L}$10)+{L}$9)")
-                    p(c6, f'=IF({L}{c5+1+r}={L}{c1+1+r},"전환",'
-                          f'IF({L}{c5+1+r}={L}$7,"상환P","만기상환"))', tx=True)
-                    p(c2, f'=IF({L}{c6+1+r}="전환",{L}{c1+1+r},0)')
-                    p(c3, f'=IF({L}{c6+1+r}="전환",0,MAX({L}$7,{L}$10)+{L}$9)')
-                    p(c4, f"={L}$10+{L}$9")
-                    continue
-                e = f"({Ln}{c2+1+r}*{L}$16+{Ln}{c2+2+r}*{L}$17)*EXP(-{L}$11*{K['dt']})"
-                b = f"({Ln}{c3+1+r}*{L}$16+{Ln}{c3+2+r}*{L}$17)*EXP(-{L}$12*{K['dt']})"
-                p(c4, f"={e}+{b}+{L}$9")
-                p(c5, f"=IF({L}$5=1,MAX(MIN({L}{c4+1+r},{L}$8),{L}{c1+1+r},{L}$7),"
-                      f"MAX({L}{c4+1+r},{L}{c1+1+r},{L}$7))")
-                p(c6, f'=IF({L}{c5+1+r}={L}{c1+1+r},"전환",IF({L}{c5+1+r}={L}$7,"상환P",'
-                      f'IF({L}{c5+1+r}={L}$8,"상환C","보유")))', tx=True)
-                p(c2, f'=IF({L}{c6+1+r}="전환",{L}{c1+1+r},'
-                      f'IF(OR({L}{c6+1+r}="상환P",{L}{c6+1+r}="상환C"),0,{e}))')
-                p(c3, f'=IF({L}{c6+1+r}="상환P",{L}$7,IF({L}{c6+1+r}="상환C",{L}$8,'
-                      f'IF({L}{c6+1+r}="전환",0,{b}+{L}$9)))')
-        # GS 블록. ⑪~⑭ 와 같은 순서지만 30% 트랜치 자신의 헤더와 전환가치를 쓴다.
-        c7 = blk(R0+7*HH, "사  [GS] 전환확률")
-        c8 = blk(R0+8*HH, "아  [GS] 위험조정할인율")
-        c9 = blk(R0+9*HH, "자  [GS] 보유가치")
-        c10 = blk(R0+10*HH, "차  [GS] 금융상품가치")
-        for i in range(n+1):
-            L = gl(3+i); Lp = gl(2+i) if i > 0 else None; Ln = gl(4+i) if i < n else None
-            for r in range(i+1):
-                p = lambda base, v, fm=N2: put(W, base+1+r, 3+i, v, fmt=fm,
-                                               size=8, align="right")
-                if i == n:
-                    # 만기에는 TF 와 GS 가 같다.
-                    p(c9, f"={L}$10+{L}$9")
-                    p(c10, f"=MAX({L}{c1+1+r},MAX({L}$7,{L}$10)+{L}$9)")
-                    p(c7, f"=IF({L}{c10+1+r}={L}{c1+1+r},1,0)", N4)
-                else:
-                    p(c9, f"={Ln}{c10+1+r}*{L}$16*EXP(-{Ln}{c8+1+r}*{K['dt']})"
-                          f"+{Ln}{c10+2+r}*{L}$17*EXP(-{Ln}{c8+2+r}*{K['dt']})+{L}$9")
-                    p(c10, f"=IF({L}$5=1,MAX(MIN({L}{c9+1+r},{L}$8),{L}{c1+1+r},{L}$7),"
-                           f"MAX({L}{c9+1+r},{L}{c1+1+r},{L}$7))")
-                    p(c7, f"=IF({L}{c10+1+r}={L}{c1+1+r},1,"
-                          f"IF(OR({L}{c10+1+r}={L}$7,{L}{c10+1+r}={L}$8),0,"
-                          f"{Ln}{c7+1+r}*{L}$16+{Ln}{c7+2+r}*{L}$17))", N4)
-                p(c8, (f"={L}{c7+1+r}*{Lp}$11+(1-{L}{c7+1+r})*{Lp}$12"
-                       if i > 0 else "=0"), P2)
 
-        RT = c10+n+3
+        # 전환가치는 두 모형이 함께 쓴다.
+        c1 = blk("전환가치")
+        for i in range(n+1):
+            L = gl(3+i)
+            for r in range(i+1):
+                put(W, c1+1+r, 3+i,
+                    f"=IF({L}$3=1,{Q(S1)}!{L}{R0+r}*{Q(S3)}!{L}{R0+r},0)",
+                    fmt=N2, size=8, align="right")
+
+        if not _gs:
+            c2 = blk("지분가치")
+            c3 = blk("부채가치")
+            c4 = blk("보유가치")
+            c5 = blk("금융상품가치")
+            c6 = blk("의사결정")
+            last = c5
+            for i in range(n+1):
+                L = gl(3+i); Ln = gl(4+i) if i < n else None
+                for r in range(i+1):
+                    p = lambda base, v, fm=N2, tx=False: put(W, base+1+r, 3+i, v,
+                            fmt=(None if tx else fm), size=8,
+                            align=("center" if tx else "right"))
+                    if i == n:
+                        p(c5, f"=MAX({L}{c1+1+r},MAX({L}$7,{L}$10)+{L}$9)")
+                        p(c6, f'=IF({L}{c5+1+r}={L}{c1+1+r},"전환",'
+                              f'IF({L}{c5+1+r}={L}$7,"상환P","만기상환"))', tx=True)
+                        p(c2, f'=IF({L}{c6+1+r}="전환",{L}{c1+1+r},0)')
+                        p(c3, f'=IF({L}{c6+1+r}="전환",0,MAX({L}$7,{L}$10)+{L}$9)')
+                        p(c4, f"={L}$10+{L}$9")
+                        continue
+                    e = f"({Ln}{c2+1+r}*{L}$16+{Ln}{c2+2+r}*{L}$17)*EXP(-{L}$11*{K['dt']})"
+                    b = f"({Ln}{c3+1+r}*{L}$16+{Ln}{c3+2+r}*{L}$17)*EXP(-{L}$12*{K['dt']})"
+                    p(c4, f"={e}+{b}+{L}$9")
+                    p(c5, f"=IF({L}$5=1,MAX(MIN({L}{c4+1+r},{L}$8),{L}{c1+1+r},{L}$7),"
+                          f"MAX({L}{c4+1+r},{L}{c1+1+r},{L}$7))")
+                    p(c6, f'=IF({L}{c5+1+r}={L}{c1+1+r},"전환",IF({L}{c5+1+r}={L}$7,"상환P",'
+                          f'IF({L}{c5+1+r}={L}$8,"상환C","보유")))', tx=True)
+                    p(c2, f'=IF({L}{c6+1+r}="전환",{L}{c1+1+r},'
+                          f'IF(OR({L}{c6+1+r}="상환P",{L}{c6+1+r}="상환C"),0,{e}))')
+                    p(c3, f'=IF({L}{c6+1+r}="상환P",{L}$7,IF({L}{c6+1+r}="상환C",{L}$8,'
+                          f'IF({L}{c6+1+r}="전환",0,{b}+{L}$9)))')
+        else:
+            # ⑪~⑭ 와 같은 순서지만 30% 트랜치 자신의 헤더와 전환가치를 쓴다.
+            c7 = blk("[GS] 전환확률")
+            c8 = blk("[GS] 위험조정할인율")
+            c9 = blk("[GS] 보유가치")
+            c10 = blk("[GS] 금융상품가치")
+            last = c10
+            for i in range(n+1):
+                L = gl(3+i); Lp = gl(2+i) if i > 0 else None; Ln = gl(4+i) if i < n else None
+                for r in range(i+1):
+                    p = lambda base, v, fm=N2: put(W, base+1+r, 3+i, v, fmt=fm,
+                                                   size=8, align="right")
+                    if i == n:
+                        # 만기에는 TF 와 GS 가 같다.
+                        p(c9, f"={L}$10+{L}$9")
+                        p(c10, f"=MAX({L}{c1+1+r},MAX({L}$7,{L}$10)+{L}$9)")
+                        p(c7, f"=IF({L}{c10+1+r}={L}{c1+1+r},1,0)", N4)
+                    else:
+                        p(c9, f"={Ln}{c10+1+r}*{L}$16*EXP(-{Ln}{c8+1+r}*{K['dt']})"
+                              f"+{Ln}{c10+2+r}*{L}$17*EXP(-{Ln}{c8+2+r}*{K['dt']})+{L}$9")
+                        p(c10, f"=IF({L}$5=1,MAX(MIN({L}{c9+1+r},{L}$8),{L}{c1+1+r},{L}$7),"
+                               f"MAX({L}{c9+1+r},{L}{c1+1+r},{L}$7))")
+                        p(c7, f"=IF({L}{c10+1+r}={L}{c1+1+r},1,"
+                              f"IF(OR({L}{c10+1+r}={L}$7,{L}{c10+1+r}={L}$8),0,"
+                              f"{Ln}{c7+1+r}*{L}$16+{Ln}{c7+2+r}*{L}$17))", N4)
+                    p(c8, (f"={L}{c7+1+r}*{Lp}$11+(1-{L}{c7+1+r})*{Lp}$12"
+                           if i > 0 else "=0"), P2)
+
+        # 마지막으로 놓인 블록 아래에 둔다. TF 는 의사결정(바)이 값 블록(마) 뒤에
+        # 오므로 last 를 그대로 쓰면 그 위에 겹쳐 쓰게 된다.
+        RT = _bs["row"] + n + 3
         sec(W, RT, "결과", span=6)
-        put(W, RT+1, 2, "30% 트랜치 금융상품가치 · TF (t=0)", bold=True)
-        put(W, RT+1, 3, f"=C{c5+1}", bold=True, fmt=N2, align="right")
-        put(W, RT+2, 2, "30% 트랜치 금융상품가치 · GS (t=0)", bold=True)
-        put(W, RT+2, 3, f"=C{c10+1}", bold=True, fmt=N2, align="right")
+        put(W, RT+1, 2, f"30% 트랜치 금융상품가치 · {tm.model} (t=0)", bold=True)
+        put(W, RT+1, 3, f"=C{last+1}", bold=True, fmt=N2, align="right")
 
     # ── 16 부채요소 ──
     D = wb.create_sheet(S16); D.sheet_view.showGridLines = False
@@ -1845,7 +1866,7 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     # 앱에서 고른 것만 값이 든다. 행 자리는 그대로 두어 아래 참조가 깨지지 않게 한다.
     B_ = ""
     _t70 = f"={Q(S14)}!C{R0}" if _gs else f"={Q(S8)}!C{R0}"
-    _t30 = (f"={Q(S15)}!C{RT+2}" if _gs else f"={Q(S15)}!C{RT+1}") if _need15 else B_
+    _t30 = f"={Q(S15)}!C{RT+1}" if _need15 else B_
     for i, (nm, fx) in enumerate([
             ("70% 트랜치 · TF", B_ if _gs else _t70),
             ("70% 트랜치 · GS", _t70 if _gs else B_),
@@ -2071,7 +2092,7 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
       ("", ""),
       ("시트 순서", ""),
       ("흐름", "가정 → 01 주가 → 02 전환가격 → … → 09 의사결정 → 10 주계약 → "
-              "11~14 GS → 15 30% 트랜치(TF·GS) → 16 부채요소 → 17~20 매도청구권 방법1 → "
+              "11~14 GS → 15 30% 트랜치 → 16 부채요소 → 17~20 매도청구권 방법1 → "
               "21~24 방법2 → 이자율곡선 → 상각표 → 결과 → 회계처리"),
       ("도달확률", "02 전환가격이 경로가중치 방법을 쓸 때 참조한다."),
       ("16 부채요소", "전환이 없으면 주가와 무관해 한 줄로 끝난다. 결과 시트가 이 값을 쓴다."),
