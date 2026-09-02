@@ -595,6 +595,19 @@ def validate(tm: Terms):
         w.append("상태확장은 노드 120개까지 권장합니다. 근사 방법을 고르거나 노드를 줄이십시오.")
     if tm.p_mode == "accrue" and tm.p_yield <= 0:
         w.append("조기상환 보장수익률이 0입니다. 복리 방식을 쓸 이유가 없습니다.")
+    # 위험 곡선이 무위험보다 낮으면 두 곡선을 바꿔 넣은 것이다. 그대로 두면
+    # 조기상환권과 전환권이 뒤집힌 값으로 나온다.
+    if tm.rf_curve and tm.cr_curve:
+        try:
+            RF, CR = curves(tm)
+            bad = [x for x in (0.25, 0.5, 1, 2, 3, 5, 7, 10)
+                   if x <= tm.T + 1e-9 and CR(x) < RF(x) - 1e-9]
+            if bad:
+                w.append(f"신용스프레드가 음수인 구간이 있습니다 "
+                         f"({bad[0]:g}년 무위험 {RF(bad[0]):.2%} > 위험 {CR(bad[0]):.2%}). "
+                         f"두 곡선을 바꿔 넣지 않았는지 확인하십시오.")
+        except Exception:
+            pass
     return w
 
 
@@ -2218,11 +2231,11 @@ with st.sidebar:
                 st.success(f"{len(_rows)}개 곡선을 찾았습니다.")
                 k1, k2 = st.columns(2)
                 _ri = k1.selectbox(
-                    "무위험으로 쓸 줄", range(len(_rows)),
+                    "무위험 곡선 (국공채)", range(len(_rows)),
                     index=_first(("국채", "국고채권"), ("국채",)),
                     format_func=lambda i: _lbl[i])
                 _ci = k2.selectbox(
-                    "위험으로 쓸 줄", range(len(_rows)),
+                    "위험 곡선 (신용위험 반영)", range(len(_rows)),
                     index=_first(("회사채 II", "무보증"), ("회사채", "무보증"), ("회사채",)),
                     format_func=lambda i: _lbl[i])
                 st.caption("사모 CB 는 **회사채 II(사모사채)** 줄이 성격에 가깝습니다. "
