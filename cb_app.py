@@ -727,6 +727,7 @@ def build_xlsx(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     thin = Side(style="thin", color="BFC7D0")
     BOX = Border(left=thin, right=thin, top=thin, bottom=thin)
     N2, N0, P2, N4, N6 = '#,##0.00', '#,##0', '0.00%', '0.0000', '0.000000'
+    DATE = 'yyyy-mm-dd'
     n = tm.n; dt_ = tm.T/n; mper = n/(tm.T*12); R0 = 20
     # 계약상 개월 → 평가기준일 기준 스텝. 엔진과 같아야 한다 (경과분을 뺀다).
     stp = lambda mth: int(round((mth-tm.elapsed_m)*mper))
@@ -789,11 +790,11 @@ def build_xlsx(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         for i in range(n+1): W.column_dimensions[gl(3+i)].width = 9
         for r, nm in enumerate(HEAD, start=1):
             put(W, r, 2, nm, bold=True, size=8, fill=LIGHT, border=True)
-        base = dt.date.today()
+        d0 = dt.date.fromisoformat(tm.d_base)
         for i in range(n+1):
             g = lambda r, v, fm=None, col="000000": put(W, r, 3+i, v, fmt=fm,
                                                         align="center", size=8, color=col)
-            g(1, "", None, GREY)
+            g(1, d0 + dt.timedelta(days=round(i*dt_*365)), DATE, GREY)
             g(2, i, N0)
             g(3, 1 if stp(tm.cv_s) <= i <= stp(tm.cv_e) else 0, N0)
             g(4, 1 if in_set(i, tm.p_s, tm.p_e, tm.p_f) else 0, N0)
@@ -1086,6 +1087,7 @@ def build_xlsx(tm: Terms, full, b0, b1, b2, ca, conv, eir):
       ("따라가기", "시트 탭을 왼쪽부터 차례로 누르면 계산이 쌓이는 순서 그대로다."),
       ("", ""),
       ("머리 17행은 모두 같다", ""),
+      ("1행 Date", "평가기준일 + 스텝 × Δt. 계약상 행사일과 대조해 보는 자리다."),
       ("1~2행", "날짜와 스텝 번호"),
       ("3~6행", "Flag — 전환 · 조기상환 · 매도청구 · 리픽싱이 가능한 열에 1이 뜬다"),
       ("7~10행", "조기상환금액 · 매도청구금액 · 쿠폰 · 만기상환"),
@@ -1139,6 +1141,7 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     thin = Side(style="thin", color="BFC7D0")
     BOX = Border(left=thin, right=thin, top=thin, bottom=thin)
     N2, N0, P2, N4, N6 = '#,##0.00', '#,##0', '0.00%', '0.0000', '0.000000'
+    DATE = 'yyyy-mm-dd'
     n = tm.n; dt_ = tm.T/n; mper = n/(tm.T*12); R0 = 20
     el = tm.elapsed_m
     stp = lambda mth: int(round((mth-el)*mper))
@@ -1179,9 +1182,10 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     title(A, 1, "전환사채 평가 조서 — 수식 포함", span=3)
     put(A, 2, 2, "노란 셀을 바꾸면 모든 트리 시트가 다시 계산된다.", color=GREY, size=9)
     spec = [
-        ("발행일", "d_issue", tm.d_issue, None, True),
-        ("평가기준일", "d_base", tm.d_base, None, True),
-        ("만기일", "d_mat", tm.d_mat, None, True),
+        # 진짜 날짜로 넣는다. 각 트리 머리 1행이 이 셀로 스텝 날짜를 계산한다.
+        ("발행일", "d_issue", dt.date.fromisoformat(tm.d_issue), DATE, True),
+        ("평가기준일", "d_base", dt.date.fromisoformat(tm.d_base), DATE, True),
+        ("만기일", "d_mat", dt.date.fromisoformat(tm.d_mat), DATE, True),
         ("경과기간 (개월)", "elm", tm.elapsed_m, N2, True),
         ("평가기준일 주가", "S0", tm.S0, N2, True),
         ("현재 전환가액", "K0", tm.K0, N2, True),
@@ -1256,29 +1260,34 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         for r, nm in enumerate(HEAD, start=1):
             put(W, r, 2, nm, bold=True, size=8, fill=LIGHT, border=True)
         for i in range(n+1):
-            L = gl(3+i)
+            L = gl(3+i); Lp = gl(2+i) if i > 0 else None
             g = lambda r, v, fm=None, col="000000": put(W, r, 3+i, v, fmt=fm,
                                                         align="center", size=8, color=col)
-            g(1, "", None, GREY); g(2, i, N0)
-            g(3, f"=IF(AND({i}>={cvs},{i}<={K['cve']}),1,0)", N0)
-            g(4, f"=IF(AND({i}>={K['pst']},{i}<={K['pen']},"
-                 f"MOD({i}-{K['pst']},{K['frq']})=0),1,0)", N0)
-            g(5, (f"=IF(AND({i}>={K['kst']},{i}<={K['ken']},"
-                  f"MOD({i}-{K['kst']},{K['kfrq']})=0),1,0)" if call_on else 0), N0)
-            g(6, f"=IF(AND({i}>0,{i}>={K['roff']},"
-                 f"MOD({i}-{K['roff']},{K['cyc']})=0),1,0)", N0, RED)
+            # 머리는 모두 2행(스텝)을 참조한다. 2행 자신도 직전 열 + 1 이라,
+            # 맨 앞 열의 0 하나에서 모든 열이 줄줄이 정해진다.
+            st = f"{L}$2"                            # 이 열의 스텝
+            yr = f"({st}*{K['dt']}+{K['elm']}/12)"   # 발행일부터 흐른 연수
+            g(1, f"={K['d_base']}+{st}*{K['dt']}*365", DATE, GREY)
+            g(2, (0 if i == 0 else f"={Lp}$2+1"), N0)
+            g(3, f"=IF(AND({st}>={cvs},{st}<={K['cve']}),1,0)", N0)
+            g(4, f"=IF(AND({st}>={K['pst']},{st}<={K['pen']},"
+                 f"MOD({st}-{K['pst']},{K['frq']})=0),1,0)", N0)
+            g(5, (f"=IF(AND({st}>={K['kst']},{st}<={K['ken']},"
+                  f"MOD({st}-{K['kst']},{K['kfrq']})=0),1,0)" if call_on else 0), N0)
+            g(6, f"=IF(AND({st}>0,{st}>={K['roff']},"
+                 f"MOD({st}-{K['roff']},{K['cyc']})=0),1,0)", N0, RED)
             # 상환할증금 = (g−c)/g × ((1+g/m)^(m·t) − 1).  g 가 0 이면 (g−c)·t
             g(7, f"=IF({L}$4=1,IF({K['pyld']}>0,"
                  f"100*(1+({K['pyld']}-{K['cpn']})/{K['pyld']}*"
-                 f"((1+{K['pyld']}/{K['pcmp']})^({K['pcmp']}*({i}*{K['dt']}+{K['elm']}/12))-1)),"
+                 f"((1+{K['pyld']}/{K['pcmp']})^({K['pcmp']}*{yr})-1)),"
                  f"{K['prate']}),0)", N2)
             g(8, f"=IF({L}$5=1,IF({K['prem']}>0,"
                  f"100*(1+({K['prem']}-{K['cpn']})/{K['prem']}*"
-                 f"((1+{K['prem']})^({i}*{K['dt']}+{K['elm']}/12)-1)),"
-                 f"100-{K['cpn']}*100*({i}*{K['dt']}+{K['elm']}/12)),999999)", N2)
-            g(9, f"=IF(AND({i}>0,MOD({i},{K['ipay']})=0),"
+                 f"((1+{K['prem']})^{yr}-1)),"
+                 f"100-{K['cpn']}*100*{yr}),999999)", N2)
+            g(9, f"=IF(AND({st}>0,MOD({st},{K['ipay']})=0),"
                  f"100*{K['cpn']}*{K['ipaym']}/12,0)", N2)
-            g(10, f"=IF({i}={K['n']},{K['red']},0)", N2)
+            g(10, f"=IF({st}={K['n']},{K['red']},0)", N2)
             if i < n:
                 g(11, forward_rate(RF, i*dt_, (i+1)*dt_), P2, AMB)
                 g(12, forward_rate(CR, i*dt_, (i+1)*dt_), P2, AMB)
@@ -1538,23 +1547,26 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     title(D, 2, "⑯ 부채요소  전환권이 없는 사채에 조기상환권만 붙인 값", span=min(n+1, 14))
     put(D, 3, 2, "전환이 없으면 주가와 무관하므로 한 줄로 끝난다. "
         "만기부터 왼쪽으로 오며 MAX(조기상환금액, 계속보유)를 고른다.", color=GREY, size=9)
-    for r, nm in enumerate(["time-step", "Flag(조기상환)", "조기상환금액", "쿠폰",
-                            "만기상환", "위험 선도이자율", "부채요소"], start=5):
+    for r, nm in enumerate(["Date", "time-step", "Flag(조기상환)", "조기상환금액", "쿠폰",
+                            "만기상환", "위험 선도이자율", "부채요소"], start=4):
         put(D, r, 2, nm, bold=True, size=8, fill=LIGHT, border=True)
     for i in range(n+1):
-        L = gl(3+i); Ln = gl(4+i) if i < n else None
+        L = gl(3+i); Lp = gl(2+i) if i > 0 else None; Ln = gl(4+i) if i < n else None
         g = lambda r, v, fm=None, col="000000": put(D, r, 3+i, v, fmt=fm,
                                                     align="center", size=8, color=col)
-        g(5, i, N0)
-        g(6, f"=IF(AND({i}>={K['pst']},{i}<={K['pen']},"
-             f"MOD({i}-{K['pst']},{K['frq']})=0),1,0)", N0)
+        st = f"{L}$5"
+        yr = f"({st}*{K['dt']}+{K['elm']}/12)"
+        g(4, f"={K['d_base']}+{st}*{K['dt']}*365", DATE, GREY)
+        g(5, (0 if i == 0 else f"={Lp}$5+1"), N0)
+        g(6, f"=IF(AND({st}>={K['pst']},{st}<={K['pen']},"
+             f"MOD({st}-{K['pst']},{K['frq']})=0),1,0)", N0)
         g(7, f"=IF({L}$6=1,IF({K['pyld']}>0,"
              f"100*(1+({K['pyld']}-{K['cpn']})/{K['pyld']}*"
-             f"((1+{K['pyld']}/{K['pcmp']})^({K['pcmp']}*({i}*{K['dt']}+{K['elm']}/12))-1)),"
+             f"((1+{K['pyld']}/{K['pcmp']})^({K['pcmp']}*{yr})-1)),"
              f"{K['prate']}),0)", N2)
-        g(8, f"=IF(AND({i}>0,MOD({i},{K['ipay']})=0),"
+        g(8, f"=IF(AND({st}>0,MOD({st},{K['ipay']})=0),"
              f"100*{K['cpn']}*{K['ipaym']}/12,0)", N2)
-        g(9, f"=IF({i}={K['n']},{K['red']},0)", N2)
+        g(9, f"=IF({st}={K['n']},{K['red']},0)", N2)
         if i < n: g(10, forward_rate(CR, i*dt_, (i+1)*dt_), P2, AMB)
         g(11, (f"=MAX({L}$7,{L}$9)+{L}$8" if i == n else
                f"=MAX({L}$7,{Ln}11*EXP(-{L}$10*{K['dt']})+{L}$8)"), N2)
@@ -1822,6 +1834,8 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     ex = [("성격", ""),
       ("살아 있는 수식", "가정 시트의 노란 셀을 바꾸면 모든 트리가 다시 계산된다."),
       ("값으로 들어간 것", "각 시트 11·12행의 선도이자율. 부트스트래핑 결과라 엑셀에서 재현하기 어렵다."),
+      ("머리와 스텝", "머리 1·3~10행은 모두 2행(스텝)을 참조한다. 2행 자신도 직전 열 + 1 이라 "
+                    "맨 앞 열의 0 하나에서 모든 열이 정해진다. 날짜도 스텝에서 나온다."),
       ("바꿀 수 없는 것", "노드 수와 리픽싱 주기는 격자 구조를 정하므로 앱에서 다시 만들어야 한다."),
       ("", ""),
       ("시트 순서", ""),
