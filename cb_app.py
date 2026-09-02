@@ -3411,6 +3411,62 @@ with tabs[7]:
                    "회계처리 탭의 배분을 그대로 쓰기 전에 판단을 확인하십시오.")
     st.caption("자본요소를 분리하기 **전에** 판단해야 하는 항목입니다 (문단 B4.3.5 말미).")
 
+    st.markdown("**조기상환권에 옵션가치가 남아 있는가**")
+    st.caption("전환을 끄면 격자가 주가와 무관해져 스텝마다 값이 하나뿐입니다. "
+               "즉 지금 조기상환권은 **불확실성이 없는 확정 계산**입니다 — "
+               "미리 내다보고 액면이 더 크면 행사하는 것뿐이라, 옵션의 시간가치가 "
+               "들어 있지 않습니다. 행사금액이 계속보유가치보다 뚜렷이 크면 행사가 "
+               "확정적이라 그래도 무방합니다. 반대로 등가격 근처이거나 외가격이면 "
+               "값을 놓치고 있는 것이고, 그때 금리모형이 필요합니다.")
+    if t.p_s <= t.p_e and t.T > 0:
+        _r0 = engine(t, conv=False, put=False, call=False)
+        _mm = _r0["memo"]
+        _dt = t.T/int(t.n)
+        _lo, _hi = step_mapper(t, int(t.n), _dt)
+        _mper = int(t.n)/(t.T*12)
+        _per = max(1, int(round(t.p_f*_mper)))
+        _s, _e = _lo(t.p_s), _hi(t.p_e)
+        # 상태확장이면 memo 키가 (i, j, 전환가격) 3튜플이다. 전환을 껐으므로
+        # 같은 스텝의 값은 어차피 하나뿐이라 첫 항목을 쓰면 된다.
+        _at = {}
+        for _k, _v in _mm.items():
+            _at.setdefault(_k[0], _v)
+        _rows, _rat = [], []
+        for _i in range(max(_s, 0), _e+1):
+            if (_i-_s) % _per or _i not in _at: continue
+            _hold = _at[_i]["E"] + _at[_i]["B"]
+            _amt = (100*(1 + accrue_rate(_i*_dt + t.elapsed_m/12, t.p_yield,
+                                         t.cpn, t.p_cmp))
+                    if t.p_mode == "accrue" else t.p_rate)
+            _rat.append(_amt/max(_hold, 1e-9))
+            _rows.append([_i, round(t.elapsed_m + _i*_dt*12), _amt, _hold, _rat[-1]])
+        if _rows:
+            _atm = sum(1 for x in _rat if 0.97 <= x <= 1.03)
+            _otm = sum(1 for x in _rat if x < 0.97)
+            st.dataframe(pd.DataFrame(
+                _rows, columns=["스텝", "발행 후 개월", "행사금액", "계속보유가치",
+                                "행사금액 ÷ 계속보유"]).style.format(
+                {"행사금액": "{:,.2f}", "계속보유가치": "{:,.2f}",
+                 "행사금액 ÷ 계속보유": "{:.3f}"}),
+                use_container_width=True, hide_index=True, height=260)
+            if _otm == len(_rat):
+                st.error(f"모든 행사일이 **외가격**입니다 (비율 최대 {max(_rat):.3f}). "
+                         f"지금 모델은 조기상환권을 {b1-b0:,.2f} 로 계산하는데, "
+                         "실제로는 외가격 옵션에도 시간가치가 있습니다. "
+                         "**금리모형 없이는 값을 0 에 가깝게 잡습니다.** "
+                         "조기상환권만 따로 BDT 등으로 평가하는 것을 검토하십시오.")
+            elif _atm + _otm > 0:
+                st.warning(f"등가격 근처가 {_atm}회, 외가격이 {_otm}회 있습니다 "
+                           f"(비율 {min(_rat):.3f} ~ {max(_rat):.3f}). 행사 여부가 "
+                           "금리에 따라 갈릴 수 있으므로 확정 계산이 옵션가치를 "
+                           "적게 잡습니다. 조기상환권만 금리모형으로 다시 재 보고 "
+                           "차이가 중요한지 확인하십시오.")
+            else:
+                st.success(f"모든 행사일에서 행사금액이 계속보유가치보다 큽니다 "
+                           f"(비율 {min(_rat):.3f} ~ {max(_rat):.3f}). 행사가 "
+                           "확정적이라 금리를 확률변수로 두어도 판단이 바뀌지 않습니다. "
+                           "확정 계산으로 충분합니다.")
+
     st.markdown("**금리모형(BDT 등) 적용 필요여부**")
     RFc, CRc = curves(t)
     def _bump(**kw):
