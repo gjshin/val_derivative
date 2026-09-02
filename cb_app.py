@@ -9,7 +9,7 @@
 금액은 전자등록금액 100 기준이다.
 """
 from __future__ import annotations
-import math, json, io, datetime as dt
+import math, json, io, calendar, datetime as dt
 from dataclasses import dataclass, asdict, field
 
 import numpy as np
@@ -86,17 +86,24 @@ def accrue_rate(t_year: float, g: float, c: float, m: int) -> float:
     return (g - c)/g * ((1 + g/m)**(m*t_year) - 1)
 
 
+def _add_months(d: dt.date, k: int) -> dt.date:
+    """d 에서 k 개월 뒤 같은 날. 그 달에 그 날이 없으면 말일로 맞춘다."""
+    y, mo = d.year + (d.month - 1 + k)//12, (d.month - 1 + k) % 12 + 1
+    return dt.date(y, mo, min(d.day, calendar.monthrange(y, mo)[1]))
+
+
 def months_between(d1: dt.date, d2: dt.date) -> float:
-    """개월 단위 경과기간. 일수는 그 달의 길이로 나눠 소수로 더한다."""
-    m = (d2.year-d1.year)*12 + (d2.month-d1.month)
-    if d2.day >= d1.day: 
-        anchor = d1
-        try: same = dt.date(d2.year, d2.month, d1.day)
-        except ValueError: same = d2
-        nxt = same + dt.timedelta(days=32)
-        nxt = dt.date(nxt.year, nxt.month, 1) - dt.timedelta(days=1)
-        return m + (d2-same).days/max(1, (nxt-same).days+1)
-    return m
+    """개월 단위 경과기간.
+
+    꽉 찬 개월을 세고, 남는 일수는 **그 구간의 실제 한 달 길이**로 나눈다.
+    말일까지 남은 날수로 나누면 안 된다 — 그러면 12월 23일에서 31일까지 8일이
+    0.89개월로 부풀어 결산일 평가가 통째로 밀린다.
+    """
+    if d2 <= d1: return 0.0
+    m = (d2.year - d1.year)*12 + (d2.month - d1.month)
+    if d2.day < d1.day: m -= 1
+    same, nxt = _add_months(d1, m), _add_months(d1, m + 1)
+    return m + (d2 - same).days/max(1, (nxt - same).days)
 
 
 def derive(tm: Terms) -> Terms:
