@@ -87,7 +87,8 @@ def main():
         # 상각표 마지막 줄 기말 = 만기상환금액
         M = wb["상각표"]
         r_eir, rows_eir, redm, nper = G["eir_table"](t, host)
-        chk("상각표 기말 = 만기상환금액", M.cell(12+len(rows_eir), 7).value, redm, 0.01)
+        # 지급일 열이 생겨 기말은 H(8열)다.
+        chk("상각표 기말 = 만기상환금액", M.cell(12+len(rows_eir), 8).value, redm, 0.01)
         chk("상각표 유효이자율", M.cell(9, 3).value, r_eir)
         chk("상각표 출발 = 배분된 주계약", M.cell(5, 3).value, rows[0][1], 0.01)
 

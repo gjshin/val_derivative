@@ -273,6 +273,9 @@ def curves(tm: Terms):
 # ══════════════════════════════════════════════════════════
 # 3. 격자 엔진
 # ══════════════════════════════════════════════════════════
+TOL = 1e-9      # 동점 판정 허용오차. 값이 100 근처라 1e-9 은 잡음보다 크고 실질 차이보다 작다
+
+
 def engine(tm: Terms, conv=True, put=True, call=False, conv_start=None):
     RF, CR = curves(tm)
     n, T = int(tm.n), tm.T
@@ -355,7 +358,10 @@ def engine(tm: Terms, conv=True, put=True, call=False, conv_start=None):
             # 전환을 택하면 주식을 받으므로 중간 노드와 같이 이자는 사라진다.
             cm = cpn_amt if is_pay(n) else 0.0
             cash = max(pv, red) + cm
-            if cv >= max(cash, 0.0) and cv > 0:
+            # 리픽싱이 주가로 재설정되는 날에는 전환가치가 정확히 100 이 되어
+            # 상환금액과 동점이 된다. 부동소수 잡음으로 갈리지 않게 전환은
+            # TOL 만큼 앞설 때만 이긴다. 동점이면 현금(부채)이다.
+            if cv >= max(cash, 0.0) + TOL and cv > 0:
                 o = dict(E=cv, B=0.0, V=cv, P=1.0, kind="conv", hold=red, cv=cv, K=KK)
             else:
                 o = dict(E=0.0, B=cash, V=cash, P=0.0, kind="mat",
@@ -385,16 +391,18 @@ def engine(tm: Terms, conv=True, put=True, call=False, conv_start=None):
             hold = E + B; inner = min(hold, kv)
             Vg = max(cv, pv, min(Vc, kv))
             # GS 의 전환확률은 GS 자신의 판단을 따른다. TF 와 다른 갈래를 고를 수 있다.
-            if cv > 0 and Vg == cv:      Pg = 1.0
-            elif Vg == pv or Vg == kv:   Pg = 0.0
-            else:                        Pg = pr
+            # GS 도 같은 순서다. 현금이 동점이면 전환확률 0 이다.
+            if abs(Vg - pv) < TOL or (kv < math.inf and abs(Vg - kv) < TOL): Pg = 0.0
+            elif cv > 0 and abs(Vg - cv) < TOL:                              Pg = 1.0
+            else:                                                            Pg = pr
             # up·dn 은 자식 노드 키다. 만기 노드에는 없어 자식 없음의 표시가 된다.
             ex = dict(hold=hold, cv=cv, K=KK, pv=pv, kv=kv, Vc=Vc, up=ku, dn=kd)
-            if i == 0:               o = dict(E=E, B=B, V=Vg, P=Pg, kind="hold", **ex)
-            elif cv >= max(pv, inner): o = dict(E=cv, B=0.0, V=Vg, P=Pg, kind="conv", **ex)
-            elif pv >= inner:          o = dict(E=0.0, B=pv, V=Vg, P=Pg, kind="put", **ex)
-            elif hold <= kv:           o = dict(E=E, B=B, V=Vg, P=Pg, kind="hold", **ex)
-            else:                      o = dict(E=0.0, B=kv, V=Vg, P=Pg, kind="call", **ex)
+            # 동점 처리는 위 만기 노드와 같다. 전환은 TOL 만큼 앞설 때만 이긴다.
+            if i == 0:                       o = dict(E=E, B=B, V=Vg, P=Pg, kind="hold", **ex)
+            elif cv >= max(pv, inner) + TOL: o = dict(E=cv, B=0.0, V=Vg, P=Pg, kind="conv", **ex)
+            elif pv >= inner - TOL:          o = dict(E=0.0, B=pv, V=Vg, P=Pg, kind="put", **ex)
+            elif hold <= kv + TOL:           o = dict(E=E, B=B, V=Vg, P=Pg, kind="hold", **ex)
+            else:                            o = dict(E=0.0, B=kv, V=Vg, P=Pg, kind="call", **ex)
         memo[key] = o
         return o
 
@@ -592,19 +600,32 @@ def allocate_full(tm: Terms, rows):
     return [(k, v, v/100*f) for k, v in rows]
 
 
+def pay_index(tm: Terms, t_year: float) -> int:
+    """상각 회차의 연수를 계약상 지급 회차 번호로 되짚는다.
+
+    t 는 평가기준일 기준이므로 경과분을 더해 발행일 기준으로 옮긴 뒤
+    지급주기로 나눈다. 지급일이 발행일 + m×주기 이므로 m 이 나온다.
+    """
+    per = max(1e-6, tm.ipay/12)
+    return max(1, int(round((t_year + tm.elapsed_m/12)/per)))
+
+
 def eir_table(tm: Terms, host):
     c = 100*tm.cpn*tm.ipay/12
     per = max(1e-6, tm.ipay/12)
     red = 100*(1 + accrue_rate(tm.T + tm.elapsed_m/12, tm.ytm, tm.cpn, tm.ytm_cmp))
-    # 지급 시점. 마지막 구간은 만기에 맞춰 기말 장부금액이 만기상환금액과 떨어지게 한다.
-    # 남는 조각이 지급주기의 10% 미만이면 직전 회차에 붙여 1일짜리 회차를 만들지 않는다.
+    # 지급일은 계약상 일정이므로 **발행일**부터 센다. 평가기준일이 발행일보다
+    # 뒤이면 첫 회차만 짧아지고 나머지는 온전한 한 주기다. 평가기준일에서
+    # 세면 지급일이 계약과 어긋나 이자비용이 회차마다 밀린다.
+    # 마지막은 만기다. 남는 조각이 주기의 10% 미만이면 앞 회차에 붙여
+    # 하루짜리 회차를 만들지 않는다.
+    ey_ = tm.elapsed_m/12
     ts, k = [], 1
-    while k*per < tm.T - 1e-9:
-        ts.append(k*per); k += 1
-    if ts and tm.T - ts[-1] < per*0.1:
-        ts[-1] = tm.T
-    else:
-        ts.append(tm.T)
+    while k*per - ey_ < tm.T - per*0.1:
+        t_ = k*per - ey_
+        if t_ > per*0.1: ts.append(t_)
+        k += 1
+    ts.append(tm.T)
     nper = len(ts)
     def pv(r):
         return (sum(c*(1+r)**(-t) for t in ts[:-1])
@@ -1230,24 +1251,32 @@ def build_xlsx(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     # ── 상각표 ──
     r_eir, rows_eir, redm, nper = eir
     M = wb.create_sheet("상각표"); M.sheet_view.showGridLines = False
-    for cc, w in (("B", 14), ("C", 12), ("D", 16), ("E", 14), ("F", 14), ("G", 16)):
+    for cc, w in (("B", 10), ("C", 13), ("D", 12), ("E", 16), ("F", 14),
+                  ("G", 14), ("H", 16)):
         M.column_dimensions[cc].width = w
-    title(M, 2, "주계약 상각표", span=6)
-    sec(M, 4, "유효이자율 역산", span=6)
+    title(M, 2, "주계약 상각표", span=7)
+    put(M, 3, 2, "지급일은 계약상 일정이므로 발행일부터 센다. 회차 수는 노드가 아니라 "
+        "이자 지급주기를 따른다.", color=GREY, size=9)
+    sec(M, 4, "유효이자율 역산", span=7)
     for i, (k, v, fm) in enumerate([("주계약 (인식액)", rows_eir[0][2] if rows_eir else b0, N2),
                                     ("만기상환금액", redm, N2),
                                     ("표면이자 (회당)", cpn_amt, N2), ("상각 횟수", nper, N0)]):
         put(M, 5+i, 2, k, border=True); put(M, 5+i, 3, v, fmt=fm, align="right", border=True)
     put(M, 9, 2, "유효이자율 (연, 이산복리)", bold=True, fill=BAND, border=True)
     put(M, 9, 3, r_eir, bold=True, fill=BAND, fmt=P2, align="right", border=True)
-    sec(M, 11, "상각 내역", span=6)
-    for i, h in enumerate(["회차", "경과연수", "기초", "이자비용", "지급이자", "기말"]):
+    sec(M, 11, "상각 내역", span=7)
+    for i, h in enumerate(["회차", "지급일", "경과연수", "기초", "이자비용",
+                           "지급이자", "기말"]):
         put(M, 12, 2+i, h, bold=True, fill=LIGHT, align="center", border=True, size=9)
+    _di = dt.date.fromisoformat(tm.d_issue); _dm = dt.date.fromisoformat(tm.d_mat)
     for i, row in enumerate(rows_eir):
         last = (i == len(rows_eir)-1); fl = BAND if last else None
-        for j2, v in enumerate(row):
-            put(M, 13+i, 2+j2, v, bold=last, fill=fl,
-                fmt=(N0 if j2 == 0 else N2), align="right", border=True)
+        # 마지막은 만기일, 나머지는 발행일 + 회차 × 지급주기다.
+        pd_ = _dm if last else _add_months(_di, int(round(pay_index(tm, row[1])*tm.ipay)))
+        put(M, 13+i, 2, row[0], bold=last, fill=fl, fmt=N0, align="right", border=True)
+        put(M, 13+i, 3, pd_, bold=last, fill=fl, fmt=DATE, align="right", border=True)
+        for j2, v in enumerate(row[1:], start=4):
+            put(M, 13+i, j2, v, bold=last, fill=fl, fmt=N2, align="right", border=True)
 
     # ── 해설 ──
     H = wb.create_sheet("해설", 0); H.sheet_view.showGridLines = False
@@ -1492,6 +1521,7 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
                     align=("center" if txt else "right"))
 
     Q = lambda nm: f"'{nm}'"
+    TOLX = repr(TOL)                # 엔진과 같은 동점 허용오차를 수식에도 쓴다
     S1, S2, S3, S4 = "01 주가", "02 전환가격", "03 전환비율", "04 전환가치"
     S5, S6, S7 = "05 지분가치", "06 부채가치", "07 보유가치"
     S8, S9, S10 = "08 금융상품가치", "09 의사결정", "10 주계약가치"
@@ -1513,17 +1543,25 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     W2.column_dimensions["B"].width = 12
     title(W2, 2, "도달확률  P = COMBIN(스텝, r) × q^(스텝−r) × (1−q)^r", span=min(n+1, 12))
     put(W2, 3, 2, "q 는 그 열의 위험중립가중치다 (① 16행). 이월 계산에서 직전 열을 "
-        "참조하므로 열마다 제 q 를 써야 엔진과 맞는다.", color=GREY, size=9)
+        "참조하므로 열마다 제 q 를 써야 엔진과 맞는다. "
+        "스텝(4행)과 하락 횟수(B열)를 참조하므로 머리를 고치면 표 전체가 따라 움직인다.",
+        color=GREY, size=9)
     put(W2, 4, 2, "r ＼ 스텝", bold=True, size=8, fill=LIGHT, border=True, align="center")
     for i in range(n+1):
-        W2.column_dimensions[gl(3+i)].width = 9
-        put(W2, 4, 3+i, i, bold=True, size=8, fmt=N0, align="center", fill=LIGHT, border=True)
+        L = gl(3+i)
+        W2.column_dimensions[L].width = 9
+        # 스텝도 직전 열 + 1 이다. 맨 앞의 0 하나가 전체를 정한다.
+        put(W2, 4, 3+i, (0 if i == 0 else f"={gl(2+i)}$4+1"),
+            bold=True, size=8, fmt=N0, align="center", fill=LIGHT, border=True)
     for r in range(n+1):
-        put(W2, 5+r, 2, r, bold=True, size=8, fmt=N0, align="center", fill=LIGHT, border=True)
+        put(W2, 5+r, 2, (0 if r == 0 else f"=$B{4+r}+1"),
+            bold=True, size=8, fmt=N0, align="center", fill=LIGHT, border=True)
         for i in range(r, n+1):
-            qq = f"{Q(S1)}!{gl(3+i)}$16"
+            L = gl(3+i)
+            qq = f"{Q(S1)}!{L}$16"
+            # 스텝은 이 열의 4행, 하락 횟수는 이 행의 B열에서 읽는다.
             put(W2, 5+r, 3+i,
-                f"=COMBIN({i},{r})*{qq}^({i}-{r})*(1-{qq})^{r}",
+                f"=COMBIN({L}$4,$B{5+r})*{qq}^({L}$4-$B{5+r})*(1-{qq})^$B{5+r}",
                 fmt='0.000000', size=8, align="right")
     W2.freeze_panes = "C5"
 
@@ -1609,11 +1647,13 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
              + (f"+{L}$9)" if i == n else ")"))
 
         W = newsheet(S9, "⑨ 의사결정트리",
-                     "금융상품가치가 무엇과 같은지로 판정한다. 70% 트랜치라 상환C 는 없다.",
-                     f"{S4} · {S8}", call_on=False)
+                     "전환가치·조기상환금액·보유가치를 직접 견준다. 70% 트랜치라 상환C 는 없다. "
+                     "리픽싱 조정일에는 전환가치가 정확히 100 이 되어 상환금액과 동점이 되므로 "
+                     "전환은 허용오차만큼 앞설 때만 이긴다. 동점이면 현금이다.",
+                     f"{S4} · {S7}", call_on=False)
         fill(W, lambda i, r, L, Lp, Ln:
-             f'=IF({Q(S8)}!{L}{R0+r}={Q(S4)}!{L}{R0+r},"전환",'
-             f'IF({Q(S8)}!{L}{R0+r}={L}$7,"상환P","보유"))', txt=True)
+             f'=IF({Q(S4)}!{L}{R0+r}>=MAX({L}$7,{Q(S7)}!{L}{R0+r})+{TOLX},"전환",'
+             f'IF({L}$7>={Q(S7)}!{L}{R0+r}-{TOLX},"상환P","보유"))', txt=True)
 
     W = newsheet(S10, "⑩ 주계약가치트리  옵션이 전혀 없는 순수 사채",
                  "주가와 무관하므로 같은 열의 값이 모두 같다.", "가정")
@@ -1624,11 +1664,14 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     if _gs:
         W = newsheet(S11, "⑪ [GS] 전환확률트리",
                      "전환 1, 현금 0, 보유면 다음 두 칸의 평균.", f"{S14} · 다음 열 {S11}")
+        # 현금(상환P·상환C)이 동점이면 0 이다. 전환은 허용오차만큼 앞설 때만 1 이다.
+        _cash = lambda L, r: (f'OR(ABS({Q(S14)}!{L}{R0+r}-{L}$7)<{TOLX},'
+                              f'ABS({Q(S14)}!{L}{R0+r}-{L}$8)<{TOLX})')
         fill(W, lambda i, r, L, Lp, Ln: (
-            f'=IF({Q(S14)}!{L}{R0+r}={Q(S4)}!{L}{R0+r},1,0)' if i == n else
-            f'=IF({Q(S14)}!{L}{R0+r}={Q(S4)}!{L}{R0+r},1,'
-            f'IF(OR({Q(S14)}!{L}{R0+r}={L}$7,{Q(S14)}!{L}{R0+r}={L}$8),0,'
-            f'{Ln}{R0+r}*{L}$16+{Ln}{R0+r+1}*{L}$17))'), N4)
+            f'=IF({_cash(L, r)},0,'
+            f'IF(ABS({Q(S14)}!{L}{R0+r}-{Q(S4)}!{L}{R0+r})<{TOLX},1,'
+            + ('0))' if i == n else
+               f'{Ln}{R0+r}*{L}$16+{Ln}{R0+r+1}*{L}$17))')), N4)
 
         W = newsheet(S12, "⑫ [GS] 위험조정할인율트리",
                      "이 칸을 직전 시점으로 할인할 때 쓰는 이자율이다. "
@@ -1699,8 +1742,8 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
                             align=("center" if tx else "right"))
                     if i == n:
                         p(c5, f"=MAX({L}{c1+1+r},MAX({L}$7,{L}$10)+{L}$9)")
-                        p(c6, f'=IF({L}{c5+1+r}={L}{c1+1+r},"전환",'
-                              f'IF({L}{c5+1+r}={L}$7,"상환P","만기상환"))', tx=True)
+                        p(c6, f'=IF({L}{c1+1+r}>=MAX({L}$7,{L}$10)+{L}$9+{TOLX},"전환",'
+                              f'IF({L}$7>={L}$10-{TOLX},"상환P","만기상환"))', tx=True)
                         p(c2, f'=IF({L}{c6+1+r}="전환",{L}{c1+1+r},0)')
                         p(c3, f'=IF({L}{c6+1+r}="전환",0,MAX({L}$7,{L}$10)+{L}$9)')
                         p(c4, f"={L}$10+{L}$9")
@@ -1710,8 +1753,9 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
                     p(c4, f"={e}+{b}+{L}$9")
                     p(c5, f"=IF({L}$5=1,MAX(MIN({L}{c4+1+r},{L}$8),{L}{c1+1+r},{L}$7),"
                           f"MAX({L}{c4+1+r},{L}{c1+1+r},{L}$7))")
-                    p(c6, f'=IF({L}{c5+1+r}={L}{c1+1+r},"전환",IF({L}{c5+1+r}={L}$7,"상환P",'
-                          f'IF({L}{c5+1+r}={L}$8,"상환C","보유")))', tx=True)
+                    p(c6, f'=IF({L}{c1+1+r}>=MAX({L}$7,MIN({L}{c4+1+r},{L}$8))+{TOLX},"전환",'
+                          f'IF({L}$7>=MIN({L}{c4+1+r},{L}$8)-{TOLX},"상환P",'
+                          f'IF({L}{c4+1+r}<={L}$8+{TOLX},"보유","상환C")))', tx=True)
                     p(c2, f'=IF({L}{c6+1+r}="전환",{L}{c1+1+r},'
                           f'IF(OR({L}{c6+1+r}="상환P",{L}{c6+1+r}="상환C"),0,{e}))')
                     p(c3, f'=IF({L}{c6+1+r}="상환P",{L}$7,IF({L}{c6+1+r}="상환C",{L}$8,'
@@ -1969,11 +2013,15 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     # 유효이자율만 역산 결과(값)이고, 나머지는 살아 있는 수식이다.
     r_eir, rows_eir, redm, nper = eir
     M = wb.create_sheet("상각표"); M.sheet_view.showGridLines = False
-    for cc, w in (("B", 14), ("C", 12), ("D", 16), ("E", 14), ("F", 14), ("G", 16)):
+    for cc, w in (("B", 10), ("C", 13), ("D", 12), ("E", 16), ("F", 14),
+                  ("G", 14), ("H", 16)):
         M.column_dimensions[cc].width = w
-    title(M, 2, "주계약 상각표", span=6)
+    title(M, 2, "주계약 상각표", span=7)
     put(M, 3, 2, "주계약(옵션 없는 사채)을 유효이자율법으로 상각한다. "
-        "기말 잔액이 만기상환금액과 맞아떨어져야 한다.", color=GREY, size=9)
+        "기말 잔액이 만기상환금액과 맞아떨어져야 한다. "
+        "지급일은 계약상 일정이므로 발행일부터 센다. 평가기준일이 발행일보다 뒤이면 "
+        "첫 회차만 짧고 나머지는 온전한 한 주기다. 회차 수는 노드가 아니라 "
+        "이자 지급주기를 따른다.", color=GREY, size=9)
     sec(M, 5, "유효이자율 역산", span=6)
     for i, (k, fx, fm, val) in enumerate([
             # 부채로 분류하면 잔여로 떨어진 금액이 인식액이다. 이론값(C16)이 아니다.
@@ -1988,28 +2036,39 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         border=True, color=AMB)
     put(M, 11, 2, "주황색은 역산 결과라 값이다. 아래 표는 이 이자율로 도는 수식이다.",
         color=AMB, size=9)
-    sec(M, 13, "상각 내역", span=6)
-    for i, h in enumerate(["회차", "경과연수", "기초", "이자비용", "지급이자", "기말"]):
+    sec(M, 13, "상각 내역", span=7)
+    for i, h in enumerate(["회차", "지급일", "경과연수", "기초", "이자비용",
+                           "지급이자", "기말"]):
         put(M, 14, 2+i, h, bold=True, fill=LIGHT, align="center", border=True, size=9)
     for i, row in enumerate(rows_eir):
         r = 15+i; last = (i == len(rows_eir)-1); fl = BAND if last else None
         prev = r-1
         put(M, r, 2, row[0], fmt=N0, align="right", border=True, bold=last, fill=fl)
-        put(M, r, 3, row[1], fmt=N2, align="right", border=True, bold=last, fill=fl)
-        put(M, r, 4, ("=$C$6" if i == 0 else f"=G{prev}"), fmt=N2, align="right",
+        # 계약상 지급일이다. 마지막은 만기일, 나머지는 발행일에 달을 더한다.
+        pdf = (f"={K['d_mat']}" if last else
+               f"=EDATE({K['d_issue']},{int(round(pay_index(tm, row[1])*tm.ipay))})")
+        put(M, r, 3, pdf, fmt=DATE, align="right", border=True, bold=last, fill=fl)
+        put(M, r, 4, row[1], fmt=N2, align="right", border=True, bold=last, fill=fl)
+        put(M, r, 5, ("=$C$6" if i == 0 else f"=H{prev}"), fmt=N2, align="right",
             border=True, bold=last, fill=fl)
         # 이자비용 = 기초 × (1+r)^기간 − 기초.  회차마다 기간이 달라 이렇게 쓴다.
-        gap = f"(C{r}" + ("" if i == 0 else f"-C{prev}") + ")"
-        put(M, r, 5, f"=D{r}*((1+$C$10)^{gap}-1)", fmt=N2, align="right",
+        gap = f"(D{r}" + ("" if i == 0 else f"-D{prev}") + ")"
+        put(M, r, 6, f"=E{r}*((1+$C$10)^{gap}-1)", fmt=N2, align="right",
             border=True, bold=last, fill=fl)
-        put(M, r, 6, "=$C$8", fmt=N2, align="right", border=True, bold=last, fill=fl)
-        put(M, r, 7, f"=D{r}+E{r}-F{r}", fmt=N2, align="right",
+        put(M, r, 7, "=$C$8", fmt=N2, align="right", border=True, bold=last, fill=fl)
+        put(M, r, 8, f"=E{r}+F{r}-G{r}", fmt=N2, align="right",
             border=True, bold=last, fill=fl)
     lr = 15+len(rows_eir)
     put(M, lr, 2, "검산 · 기말 잔액 = 만기상환금액", bold=True, border=True)
-    put(M, lr, 3, f"=G{lr-1}-$C$7", fmt=N2, align="right", border=True)
-    put(M, lr, 5, f'=IF(ABS(G{lr-1}-$C$7)<0.01,"적합","확인 필요")',
+    put(M, lr, 4, f"=H{lr-1}-$C$7", fmt=N2, align="right", border=True)
+    put(M, lr, 6, f'=IF(ABS(H{lr-1}-$C$7)<0.01,"적합","확인 필요")',
         align="center", border=True)
+    # 유효이자율은 값이라, 가정을 고쳐 인식액이 움직이면 표가 닫히지 않는다.
+    put(M, lr+1, 2, "검산 · 인식액이 역산 당시와 같은가", bold=True, border=True)
+    put(M, lr+1, 4, f"=C6-{rows_eir[0][2] if rows_eir else 0!r}", fmt=N2,
+        align="right", border=True)
+    put(M, lr+1, 6, f'=IF(ABS(C6-{rows_eir[0][2] if rows_eir else 0!r})<0.0001,'
+        f'"적합","앱에서 다시 만드십시오")', align="center", border=True)
 
     # ── 회계처리 ──
     E = wb.create_sheet("회계처리"); E.sheet_view.showGridLines = False
@@ -2101,6 +2160,15 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
       ("사실", "05·06은 같은 열의 09를 보지만, 07은 다음 열의 05·06을 본다."),
       ("결과", "오른쪽 열이 먼저 확정되고 왼쪽으로 오므로 고리가 닫히지 않는다."),
       ("확인", "아무 칸에서 F2를 누르면 참조 테두리가 오른쪽이나 같은 열에만 생긴다."),
+      ("", ""),
+      ("동점을 어떻게 깨는가", ""),
+      ("언제 생기나", "리픽싱이 주가로 재설정되는 날에는 전환가액 = 주가이므로 "
+                  "전환가치가 정확히 100 이 된다. 같은 날 조기상환금액도 100 이면 값이 같다."),
+      ("규칙", "전환은 허용오차(1e-9)만큼 앞설 때만 이긴다. 동점이면 현금(상환)이다. "
+             "지분으로 보면 무위험이자율로 할인되어 값이 올라가므로 현금 쪽이 보수적이다."),
+      ("왜 정해야 하나", "정해 두지 않으면 부동소수 잡음이 갈라 놓는다. "
+                    "TF 는 지분과 부채를 다른 이자율로 할인하므로 한 노드의 판정이 "
+                    "전체 값을 몇 포인트씩 움직인다."),
       ("", ""),
       ("주의", ""),
       ("상태확장", "수식 조서는 재결합 격자에서만 만들 수 있다. 앱이 경로가중치로 대체한다."),
