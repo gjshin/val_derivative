@@ -110,16 +110,18 @@ def solve(path, sheets):
 def main():
     G = load_app()
     # C10·C11 이 적용 모형의 트랜치다. 엔진의 b2·b3 는 이미 모형을 반영한 값이다.
-    BASE = [("적용 70% 트랜치", "C10", "b2"), ("70% 트랜치 GS", "C7", "gs"),
-            ("적용 30% 트랜치", "C11", "b3"), ("주계약", "C16", "b0"),
+    # 조서에는 앱에서 고른 방법만 들어간다. 그래서 적용값과 공통 항목만 본다.
+    BASE = [("적용 70% 트랜치", "C10", "b2"), ("주계약", "C16", "b0"),
             ("부채요소", "C17", "b1"), ("조기상환청구권", "C18", None),
-            ("매도청구권 방법1", "C20", "ctp1"), ("매도청구권 방법2", "C21", "ctp2"),
             ("매도청구권 적용값", "C22", "ca")]
     bad = 0
     for lbl, over in CASES:
         # 전환권대가는 자본으로 분류할 때만 나온다. 부채면 조서가 빈칸이 맞다.
         ROWS = BASE + ([("전환권대가", "C23", "conv")]
                        if over.get("conv_class", "equity") == "equity" else [])
+        # 유무가치비교법일 때만 30% 트랜치가 조서에 있다
+        if over.get("k_method", 0) == 0:
+            ROWS = ROWS + [("적용 30% 트랜치", "C11", "b3")]
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "wb.xlsx")
             eng, res, acc = build(G, over, path)
