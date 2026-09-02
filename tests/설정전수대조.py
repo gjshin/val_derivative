@@ -55,7 +55,11 @@ CASES = [
     # 조기상환
     ("조기상환 시작 12개월", dict(p_s=12.), None),
     ("조기상환 종료 36개월", dict(p_e=36., _gap=3.), None),
-    ("조기상환 주기 6개월", dict(p_f=6., _gap=3.), None),
+    ("조기상환 주기 9개월", dict(p_f=9., _gap=3.), None),
+    ("조기상환 주기 6개월", dict(p_f=6., _gap=3.),
+     "행사금액이 고정 100 이면 행사일이 드물어도 값이 거의 같다. 각 행사일에서 "
+     "MAX(계속보유, 100) 이라 값이 100 아래로 못 내려가고, 첫 행사일이 하한을 "
+     "정한 뒤로는 빈도가 거의 영향을 주지 않는다. 9개월로 늘리면 움직인다."),
     ("조기상환 행사금액 105", dict(p_rate=105.), None),
     ("조기상환 보장 5%", dict(p_mode="accrue", p_yield=.05), None),
     ("보장 복리 연 2회", dict(p_mode="accrue", p_yield=.05, p_cmp=2), None),
@@ -67,7 +71,9 @@ CASES = [
     ("매도청구 주기 9개월 · 의무보유 없음", dict(k_f=9., k_lock=0., _gap=3.), None),
     ("매도청구 프리미엄 6%", dict(k_prem=.06), None),
     ("매도청구 한도 60%", dict(k_w=.6), None),
-    ("의무보유 40개월", dict(k_lock=40.), None),
+    ("의무보유 40개월", dict(k_lock=40.),
+     "매도청구 종료가 24개월인데 의무보유 25개월(기본)이 이미 콜 기간 전체를 "
+     "덮는다. 그 이상 늘려도 콜 기간에는 어차피 전환할 수 없어 값이 같다."),
     ("평가방법 1 혼합할인율", dict(k_method=1), None),
     ("평가방법 2 지분·부채", dict(k_method=2), None),
     # 모형·분류
@@ -175,7 +181,8 @@ def solve(path, sheets):
     return out
 
 
-ROWS = [("적용 70% 트랜치", "C10", "b2"), ("적용 30% 트랜치", "C11", "b3"),
+# 조서에는 앱에서 고른 방법만 들어간다. 30% 트랜치는 유무가치비교법에만 있다.
+ROWS = [("적용 70% 트랜치", "C10", "b2"),
         ("주계약", "C16", "b0"), ("부채요소", "C17", "b1"),
         ("매도청구권 적용값", "C22", "ca")]
 
@@ -206,8 +213,9 @@ def run_one(idx):
 def main():
     import json, subprocess
     bad, dead, base = [], [], {}      # 기준선은 격자별로 따로 잡는다
-    print("%-22s %10s %10s %10s %10s %10s  %s"
-          % ("설정", "70%", "30%", "주계약", "부채요소", "매도청구", "판정"))
+    # 열은 ROWS 를 따라간다. 조서에 실리는 항목이 바뀌면 여기도 같이 바뀐다.
+    _hdr = "%-22s" + " %10s"*len(ROWS) + "  %s"
+    print(_hdr % ("설정", *[nm for nm, _, _ in ROWS], "판정"))
     for idx in range(len(CASES)):
         r = subprocess.run([sys.executable, os.path.abspath(__file__), str(idx)],
                            capture_output=True, text=True)
@@ -243,8 +251,7 @@ def main():
             dead.append(lbl); mark = "★안 움직임"
         elif ok and not moved:
             mark = "동일 (정상)"
-        print("%-22s %10s %10s %10s %10s %10s  %s"
-              % (lbl, *[f"{v:.4f}" if v is not None else "없음" for v in vals], mark))
+        print(_hdr % (lbl, *[f"{v:.4f}" if v is not None else "없음" for v in vals], mark))
     print()
     if bad:
         print("불일치 %d건" % len(bad))

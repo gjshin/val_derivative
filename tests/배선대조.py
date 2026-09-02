@@ -192,6 +192,50 @@ def main():
         print("   %-22s n=%2d  최대 차이 %s %.6f  %s"
               % (lbl, n, nm2 or "—", gap, "OK" if ok else "★"))
 
+    print("\n0. 경과기간 계산")
+    # 꽉 찬 개월을 세고 남는 일수는 그 구간의 실제 한 달 길이로 나눈다.
+    # 말일까지 남은 날수로 나누면 12월 23일→31일 8일이 0.89개월로 부풀어
+    # 결산일 평가가 통째로 밀린다.
+    import datetime as _dt
+    _D = _dt.date.fromisoformat
+    for a, b, want in (("2025-05-23", "2025-12-31", 7.2581),
+                       ("2025-05-23", "2025-12-20", 6.9000),
+                       ("2025-05-23", "2025-06-30", 1.2333),
+                       ("2025-03-31", "2025-12-31", 9.0000),
+                       ("2025-11-30", "2025-12-31", 1.0323),
+                       ("2025-01-31", "2025-02-28", 1.0000),
+                       ("2025-05-23", "2026-05-23", 12.0000),
+                       ("2025-05-23", "2025-05-23", 0.0000)):
+        got = G["months_between"](_D(a), _D(b))
+        ok = abs(got - want) < 1e-4
+        if not ok: bad += 1
+        print("   %s → %s  %8.4f 개월  %s"
+              % (a, b, got, "OK" if ok else "★ %.4f 기대" % want))
+
+    print("\n3-2. 행사 시작이 계약일보다 앞서지 않는가")
+    # 스텝을 반올림으로 잡으면 계약일 전 노드에서 행사가 열려 옵션이 과대평가된다.
+    # 노드 날짜를 계약일과 직접 견주되, 달력 근사만큼(최대 5일)은 같은 날로 본다.
+    _d0 = _dt.date(2025, 5, 23)
+    for gap, glab in ((1., "월"), (12/26, "2주"), (12/52, "주")):
+        worst, over = 0, 0
+        for k in range(0, 400, 14):
+            t = terms(G, d_issue="2025-05-23", d_mat="2029-05-23", gap_m=gap,
+                      d_base=(_d0 + _dt.timedelta(days=k)).isoformat())
+            if t.T <= 0.2: continue
+            lo, _ = G["step_mapper"](t, t.n, t.T/t.n)
+            day = t.T/t.n*365
+            for mth in (12., 30.):
+                i = lo(mth)
+                if i > t.n: continue
+                nd = _D(t.d_base) + _dt.timedelta(days=round(i*day))
+                d = (nd - G["_add_months"](_d0, int(mth))).days
+                worst = min(worst, d)
+                if d < -5: over += 1
+        ok = over == 0
+        if not ok: bad += 1
+        print("   %-4s 노드  최대 앞당김 %3d일 · 허용오차 밖 %d건  %s"
+              % (glab, worst, over, "OK" if ok else "★"))
+
     print("\n4. 상태확장을 골랐을 때 수식 조서가 그 사실을 밝히는가")
     # 상태확장 격자는 재결합하지 않아 엑셀 트리로 못 옮긴다. 조서는 경로가중치로
     # 다시 계산하므로 앱 값과 다르다. 그 차이를 조서가 스스로 적어야 한다.
