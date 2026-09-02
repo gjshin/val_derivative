@@ -3417,26 +3417,39 @@ with tabs[7]:
         tt = Terms(**asdict(t))
         for k2, v2 in kw.items(): setattr(tt, k2, v2)
         derive(tt); return pick(engine(tt, call=False), t.model)
-    d_rate = (_bump(rf_curve=[(x, y+0.01) for x, y in t.rf_curve])
-              - _bump(rf_curve=[(x, y-0.01) for x, y in t.rf_curve]))/2
+    # BDT 는 금리 "수준" 을 확률변수로 둔다. 그러니 두 곡선을 함께 흔들어야
+    # 금리 노출을 제대로 잰다. 무위험 곡선만 흔들면 스프레드가 그만큼 줄었다
+    # 늘었다 하며 상쇄되고, 부채 부분은 위험이자율로 할인되므로 거의 안 움직인다.
+    _par = lambda d: dict(rf_curve=[(x, y+d) for x, y in t.rf_curve],
+                          cr_curve=[(x, y+d) for x, y in t.cr_curve])
+    d_lvl = (_bump(**_par(0.01)) - _bump(**_par(-0.01)))/2
+    d_spr = (_bump(cr_curve=[(x, y+0.01) for x, y in t.cr_curve])
+             - _bump(cr_curve=[(x, y-0.01) for x, y in t.cr_curve]))/2
     d_vol = (_bump(sig=t.sig+0.10) - _bump(sig=max(0.01, t.sig-0.10)))/2
-    ratio = abs(d_rate)/max(abs(d_vol), 1e-9)
+    ratio = abs(d_lvl)/max(abs(d_vol), 1e-9)
     spr = CRc(t.T) - RFc(t.T)
     share = spr/CRc(t.T) if CRc(t.T) > 1e-9 else 0.0
     st.dataframe(pd.DataFrame([
-        ["무위험금리 ±1%p", f"{d_rate:+,.4f}", f"{abs(d_rate)/max(b2,1e-9)*100:.2f}%"],
+        ["금리 수준 ±1%p (두 곡선 평행)", f"{d_lvl:+,.4f}",
+         f"{abs(d_lvl)/max(b2,1e-9)*100:.2f}%"],
+        ["신용스프레드 ±1%p (위험 곡선만)", f"{d_spr:+,.4f}",
+         f"{abs(d_spr)/max(b2,1e-9)*100:.2f}%"],
         ["변동성 ±10%p", f"{d_vol:+,.4f}", f"{abs(d_vol)/max(b2,1e-9)*100:.2f}%"],
-        ["금리 ÷ 주가 민감도", f"{ratio:.3f}", ""],
+        ["금리 수준 ÷ 주가 민감도", f"{ratio:.3f}", ""],
         [f"{t.T:.2f}년 신용스프레드", f"{spr*100:.2f}%p", f"할인율 중 {share*100:.0f}%"]],
         columns=["항목", "값", "비중"]), use_container_width=True, hide_index=True)
     if ratio < 0.2 or share > 0.7:
         st.success("금리를 확률변수로 둘 실익이 작습니다. 신용스프레드가 값을 지배하므로 "
                    "금리 고정 격자로 충분합니다.")
     else:
-        st.warning("금리 민감도가 무시할 수준이 아닙니다. BDT 등 금리모형 적용 여부를 "
-                   "검토하고 그 판단을 조서에 남기십시오.")
-    st.caption("책 [사례 4-3] 실측 — 금리변동성 20%를 넣어도 조기상환권이 "
-               "832.14에서 836.22로 0.49%만 움직입니다.")
+        st.warning("금리 수준 민감도가 무시할 수준이 아닙니다. BDT 등 금리모형 적용 여부를 "
+                   "검토하고 그 판단을 조서에 남기십시오. 특히 잔존기간이 길고 조기상환권이 "
+                   "액면 근처에서 자주 열리면 행사 판단 자체가 금리에 좌우됩니다.")
+    st.caption("두 곡선을 함께 흔드는 이유 — 부채 부분은 위험이자율로 할인되므로 "
+               "무위험 곡선만 흔들면 스프레드 변화와 상쇄되어 노출이 최대 수십 배 "
+               "과소하게 잡힙니다. 참고로 책 [사례 4-3] 은 금리변동성 20%를 넣어도 "
+               "조기상환권이 832.14에서 836.22로 0.49%만 움직인다고 실측합니다. "
+               "민감도가 크더라도 금리변동성이 낮으면 값 차이는 작을 수 있습니다.")
 
 with tabs[8]:
     st.write("가정 · 트리 시트 · 이자율곡선 · 결과 · 회계처리 · 상각표로 이루어진 조서를 만듭니다. "
