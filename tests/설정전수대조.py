@@ -207,8 +207,9 @@ def run_one(idx):
 def main():
     import json, subprocess
     bad, dead, base = [], [], {}      # 기준선은 격자별로 따로 잡는다
-    print("%-22s %10s %10s %10s %10s %10s  %s"
-          % ("설정", "70%", "30%", "주계약", "부채요소", "매도청구", "판정"))
+    # 열은 ROWS 를 따라간다. 조서에 실리는 항목이 바뀌면 여기도 같이 바뀐다.
+    _hdr = "%-22s" + " %10s"*len(ROWS) + "  %s"
+    print(_hdr % ("설정", *[nm for nm, _, _ in ROWS], "판정"))
     for idx in range(len(CASES)):
         r = subprocess.run([sys.executable, os.path.abspath(__file__), str(idx)],
                            capture_output=True, text=True)
@@ -244,8 +245,7 @@ def main():
             dead.append(lbl); mark = "★안 움직임"
         elif ok and not moved:
             mark = "동일 (정상)"
-        print("%-22s %10s %10s %10s %10s %10s  %s"
-              % (lbl, *[f"{v:.4f}" if v is not None else "없음" for v in vals], mark))
+        print(_hdr % (lbl, *[f"{v:.4f}" if v is not None else "없음" for v in vals], mark))
     print()
     if bad:
         print("불일치 %d건" % len(bad))
