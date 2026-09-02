@@ -684,6 +684,54 @@ def validate(tm: Terms):
 # ══════════════════════════════════════════════════════════
 # 4. 주가·변동성
 # ══════════════════════════════════════════════════════════
+@st.cache_data(show_spinner=False)
+def korean_font():
+    """그림에 쓸 한글 글꼴 이름. 없으면 None.
+
+    이름만 보고 고르면 글꼴이 있어도 한글 글리프가 없어 네모로 나온다.
+    matplotlib 에 딸린 FT2Font 로 '가'(U+AC00) 가 실제로 있는지 확인한다.
+    """
+    try:
+        from matplotlib import font_manager as fm
+        from matplotlib.ft2font import FT2Font
+    except Exception:
+        return None
+    pref = ("NanumGothic", "NanumBarunGothic", "NanumSquare", "Malgun Gothic",
+            "AppleGothic", "Apple SD Gothic Neo", "Noto Sans CJK KR",
+            "Noto Sans KR", "Source Han Sans KR", "UnDotum", "Baekmuk Gulim",
+            "WenQuanYi Zen Hei", "Droid Sans Fallback")
+
+    def has_hangul(path):
+        try:
+            return 0xAC00 in FT2Font(path).get_charmap()
+        except Exception:
+            return False
+
+    byname = {}
+    for f in fm.fontManager.ttflist:
+        byname.setdefault(f.name, f.fname)
+    for nm in pref:
+        if nm in byname and has_hangul(byname[nm]):
+            return nm
+    for nm, path in sorted(byname.items()):
+        if has_hangul(path):
+            return nm
+    return None
+
+
+def use_korean_font():
+    """그림을 그리기 전에 부른다. 글꼴을 찾았으면 이름, 못 찾았으면 None."""
+    nm = korean_font()
+    try:
+        import matplotlib
+        matplotlib.rcParams["axes.unicode_minus"] = False   # 음수 부호도 네모가 된다
+        if nm:
+            matplotlib.rcParams["font.family"] = nm
+    except Exception:
+        pass
+    return nm
+
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_prices(code: str, days: int, market: str, end: str = None):
     """야후 파이낸스에서 수정주가를 받는다.
@@ -799,6 +847,44 @@ def parse_prices(txt: str):
     return out
 
 
+def parse_prices_multi(txt: str):
+    """여러 종목의 종가가 한 파일에 들어 있을 때 열마다 갈라 읽는다.
+
+    첫 줄이 머리글이고 첫 열이 일자, 나머지 열이 종목별 종가인 형태를 본다.
+    야후·거래소·증권사에서 여러 종목을 한 번에 내려받으면 대개 이 꼴이다.
+    """
+    import re
+    lines = [l for l in (x.rstrip() for x in txt.splitlines()) if l.strip()]
+    if not lines: return []
+
+    def cut(l):
+        l = re.sub(r'"([^"]*)"', lambda m: m.group(1).replace(",", ""), l)
+        return [x.strip() for x in re.split(r"[\t,;]|\s{2,}", l)]
+
+    isdate = lambda x: bool(re.match(r"^\d{4}[-./]\d{1,2}[-./]\d{1,2}$", x.strip()))
+    hdr = cut(lines[0])
+    body = [cut(l) for l in lines[1:]]
+    body = [c for c in body if c and isdate(c[0])]
+    if len(body) < 10 or len(hdr) < 3: return []
+    out = []
+    for j in range(1, len(hdr)):
+        nm = hdr[j].strip() or f"열{j}"
+        rows = []
+        for c in body:
+            if j >= len(c): continue
+            try:
+                v = float(c[j].replace(",", "").replace("원", ""))
+            except Exception:
+                continue
+            if v <= 0: continue
+            d = c[0].replace(".", "-").replace("/", "-").split("-")
+            rows.append((f"{d[0]}-{int(d[1]):02d}-{int(d[2]):02d}", v))
+        if len(rows) >= 10:
+            if rows[0][0] > rows[-1][0]: rows.reverse()
+            out.append((nm, rows))
+    return out
+
+
 def parse_yields(txt: str, unit: str = "auto"):
     """만기별 수익률을 읽는다.
 
@@ -886,6 +972,496 @@ def read_kisnet(name: str, data: bytes):
 def curve_text(pts):
     """곡선을 화면 입력 형식(개월 · 수익률%)으로 되돌린다."""
     return "\n".join(f"{round(t*12):d}\t{y*100:.3f}%" for t, y in pts)
+
+
+# ══════════════════════════════════════════════════════════
+# 4-1. 리포트 공통 서식
+# ══════════════════════════════════════════════════════════
+# 조서와 같은 손맛으로 보이도록 색·글꼴·번호서식을 한곳에 모았다.
+RPT = dict(
+    ink="1F3864", sub="44618C", grey="7F7F7F", amber="9A7200",
+    green="1F6B44", red="A6301F", band="EFF3F8", light="F7F9FC",
+    tint="E4EBF5", hair="D6DCE5", warm="FFF7E6",
+)
+R_N0, R_N2, R_N4, R_N6 = "#,##0", "#,##0.00", "#,##0.0000", "0.000000"
+R_P2, R_P4 = "0.00%", "0.0000%"
+R_YMD = "yyyy-mm-dd"
+
+
+def report_kit(wb, font="맑은 고딕"):
+    """리포트 한 권에 쓸 서식 도구를 만든다.
+
+    put   — 셀 하나. 값·수식·서식·색을 한 번에 준다.
+    head  — 표지 제목줄
+    sec   — 구역 머리 (색 띠)
+    cols  — 표 머리줄
+    note  — 회색 주석
+    """
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter as gl
+
+    thin = Side(style="thin", color=RPT["hair"])
+    box = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    def put(ws, r, c, v, *, fmt=None, bold=False, size=10, color=None,
+            fill=None, align=None, border=False, wrap=False, italic=False):
+        cl = ws.cell(r, c, v)
+        cl.font = Font(name=font, size=size, bold=bold, italic=italic,
+                       color=color or RPT["ink"])
+        if fmt: cl.number_format = fmt
+        if fill: cl.fill = PatternFill("solid", fgColor=fill)
+        if align or wrap:
+            cl.alignment = Alignment(horizontal=align, vertical="center", wrap_text=wrap)
+        if border: cl.border = box
+        return cl
+
+    def head(ws, r, txt, sub=None, span=8):
+        put(ws, r, 2, txt, bold=True, size=16, color=RPT["ink"])
+        ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=1+span)
+        if sub:
+            put(ws, r+1, 2, sub, size=9.5, color=RPT["grey"], wrap=True)
+            ws.merge_cells(start_row=r+1, start_column=2, end_row=r+1, end_column=1+span)
+            ws.row_dimensions[r+1].height = 28
+        ws.row_dimensions[r].height = 24
+
+    def sec(ws, r, txt, span=8, tone=None):
+        for c in range(2, 2+span):
+            put(ws, r, c, txt if c == 2 else None, bold=(c == 2), size=10.5,
+                color=RPT["ink"], fill=tone or RPT["band"])
+        ws.row_dimensions[r].height = 20
+
+    def cols(ws, r, names, widths=None, start=2):
+        for i, nm in enumerate(names):
+            put(ws, r, start+i, nm, bold=True, size=9, fill=RPT["tint"],
+                align="center", border=True, wrap=True)
+        if widths:
+            for i, w in enumerate(widths):
+                ws.column_dimensions[gl(start+i)].width = w
+        ws.row_dimensions[r].height = 26
+
+    def note(ws, r, txt, span=8, tone=None):
+        put(ws, r, 2, txt, size=9, color=tone or RPT["grey"], wrap=True)
+        ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=1+span)
+        ws.row_dimensions[r].height = max(16, 14*(1+len(txt)//95))
+
+    def sheet(name, tab=None, widths=None, freeze=None, landscape=False):
+        ws = wb.create_sheet(name)
+        ws.sheet_view.showGridLines = False
+        ws.sheet_properties.tabColor = tab or RPT["sub"]
+        ws.column_dimensions["A"].width = 2.2
+        if widths:
+            for i, w in enumerate(widths):
+                ws.column_dimensions[gl(2+i)].width = w
+        if freeze: ws.freeze_panes = freeze
+        ws.page_setup.orientation = "landscape" if landscape else "portrait"
+        ws.page_setup.fitToWidth = 1; ws.page_setup.fitToHeight = 0
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+        return ws
+
+    return dict(put=put, head=head, sec=sec, cols=cols, note=note, sheet=sheet, gl=gl)
+
+
+def _brackets(pts, t):
+    """t 를 감싸는 입력곡선 두 점의 번호. 범위 밖이면 (i, i) 로 한 점만 준다."""
+    if not pts: return (0, 0)
+    if t <= pts[0][0]: return (0, 0)
+    if t >= pts[-1][0]: return (len(pts)-1, len(pts)-1)
+    for i in range(1, len(pts)):
+        if t <= pts[i][0]: return (i-1, i)
+    return (len(pts)-1, len(pts)-1)
+
+
+def lerp_formula(t, pts, col, row0, sh=None):
+    """엑셀에서 선형보간. 입력 셀을 가리키므로 노란 셀을 고치면 따라 움직인다.
+
+    col 은 값이 든 열 문자, row0 은 첫 점의 행, sh 는 그 표가 있는 시트다.
+    범위 밖이면 끝점을 그대로 쓴다 — 앱의 _lin 과 같다.
+    """
+    q = f"'{sh}'!" if sh else ""
+    i, j = _brackets(pts, t)
+    if i == j: return f"={q}${col}${row0+i}"
+    x0, x1 = pts[i][0], pts[j][0]
+    return (f"={q}${col}${row0+i}+({q}${col}${row0+j}-{q}${col}${row0+i})"
+            f"*({t:.12g}-{x0:.12g})/({x1:.12g}-{x0:.12g})")
+
+
+def build_xlsx_vol(series, tdays=250, drop=True, mad_k=2.5, pick="median",
+                   applied=None, asof=None):
+    """변동성 산출내역 리포트. 계산이 전부 수식으로 들어간다.
+
+    series 는 [(이름, [(일자, 종가), …]), …] 다. 하나면 대상회사만,
+    여럿이면 비상장 평가에서 쓰는 피어 묶음이다.
+    pick 은 여러 회사를 하나로 줄이는 방법 — median · mean · max · min.
+    """
+    from openpyxl import Workbook
+    wb = Workbook(); wb.remove(wb.active)
+    K = report_kit(wb)
+    put, head, sec, cols, note, sheet = (K[x] for x in
+        ("put", "head", "sec", "cols", "note", "sheet"))
+    series = [(nm, px) for nm, px in series if px and len(px) >= 10]
+    if not series: raise ValueError("종가가 10개 이상인 계열이 하나도 없습니다.")
+    many = len(series) > 1
+    YEL = "FFF9DB"
+    PICKS = {"median": "중앙값", "mean": "단순평균", "max": "최댓값", "min": "최솟값"}
+
+    # 회사별 시트의 행 자리. 한곳에서 정해 두고 수식이 이 이름만 쓴다.
+    R_TD, R_MK, R_DR = 5, 6, 7          # 거래일수 · MAD 배수 · 이상치 제거
+    R_NP, R_NR, R_MD = 8, 9, 10         # 종가 수 · 수익률 수 · 중앙값
+    R_MA, R_LO, R_HI = 11, 12, 13       # MAD · 하한 · 상한
+    R_EX, R_SD, R_AN = 14, 15, 16       # 제외 · 일 변동성 · 연 변동성
+    HDR, R0 = 19, 20                    # 표 머리 · 첫 자료행
+
+    names = [f"{i:02d} {_vsafe(nm)}"[:31] for i, (nm, _) in enumerate(series, 1)]
+
+    # ── 표지 ──
+    C = sheet("표지", tab=RPT["ink"], widths=[24, 20, 18, 18, 16, 16, 16, 16])
+    head(C, 2, "변동성 산출내역",
+         "전환사채 평가에 쓸 주가변동성을 로그수익률의 표본표준편차로 구한 내역이다. "
+         "노란 셀만 입력이고 나머지는 수식이라, 거래일수나 이상치 배수를 바꾸면 "
+         "표 전체가 다시 계산된다.")
+    r = 5
+    sec(C, r, "산출 요약"); r += 1
+    cols(C, r, ["항목", "내용"], [26, 62]); r += 1
+    for k, v in [("평가기준일", (asof or dt.date.today()).isoformat()),
+                 ("대상 계열", f"{len(series)}개 — " + " · ".join(nm for nm, _ in series)),
+                 ("수익률", "일별 로그수익률  ln(종가 ÷ 직전 종가)"),
+                 ("이상치 처리", (f"중앙값 절대편차(MAD) × {mad_k:g} 밖을 제외"
+                                if drop else "제외하지 않음")),
+                 ("표준편차", "표본표준편차 STDEV.S — 자유도 n−1"),
+                 ("연환산", f"일 변동성 × √{tdays:g}"),
+                 ("종합 방법", PICKS.get(pick, pick) if many else "대상회사 단일")]:
+        put(C, r, 2, k, bold=True, border=True, fill=RPT["light"])
+        put(C, r, 3, v, border=True, wrap=True)
+        C.merge_cells(start_row=r, start_column=3, end_row=r, end_column=8)
+        r += 1
+    r += 1
+    sec(C, r, "결과"); r += 1
+    cols(C, r, ["구분", "연 변동성"], [26, 18]); r += 1
+    res = r
+    put(C, r, 2, "종합", bold=True, border=True, fill=RPT["warm"])
+    put(C, r, 3, ("='종합'!$C$6" if many else f"='{names[0]}'!$C${R_AN}"),
+        fmt=R_P2, bold=True, border=True, fill=RPT["warm"], align="right")
+    r += 1
+    if applied is not None:
+        put(C, r, 2, "앱에 적용한 값", bold=True, border=True)
+        put(C, r, 3, applied, fmt=R_P2, border=True, align="right", color=RPT["amber"])
+        put(C, r+1, 2, "차이", bold=True, border=True)
+        put(C, r+1, 3, f"=C{r}-C{res}", fmt=R_P4, border=True, align="right")
+        r += 2
+    r += 1
+    note(C, r, "주황색 숫자는 앱이 넣은 값이고 노란 셀은 바꿔도 되는 입력이다. "
+               "종가는 수정주가여야 한다 — 유상증자·액면분할·배당이 반영되지 않은 "
+               "종가를 쓰면 그날 하루가 통째로 이상치가 된다.")
+
+    # ── 회사별 시트 ──
+    for (nm, px), sn in zip(series, names):
+        W = sheet(sn, widths=[15, 13, 14, 13, 9, 14], freeze=f"B{R0}")
+        head(W, 2, f"{nm} — 일별 로그수익률", span=6)
+        n = len(px); last = R0 + n - 1
+        D1, DN = f"$D${R0+1}", f"$D${last}"
+        sec(W, 4, "입력과 결과", span=6)
+        lab = [(R_TD, "연 거래일수", tdays, R_N0, True),
+               (R_MK, "MAD 배수", mad_k, "0.0#", True),
+               (R_DR, "이상치 제거 (1/0)", 1 if drop else 0, R_N0, True),
+               (R_NP, "관측 종가", f"=COUNT($C${R0}:$C${last})", R_N0, False),
+               (R_NR, "수익률", f"=COUNT({D1}:{DN})", R_N0, False),
+               (R_MD, "중앙값", f"=MEDIAN({D1}:{DN})", R_N6, False),
+               (R_MA, "MAD (×1.4826)", f"=MEDIAN($E${R0+1}:$E${last})*1.4826",
+                R_N6, False),
+               (R_LO, "정상범위 하한", f"=$C${R_MD}-$C${R_MK}*$C${R_MA}", R_N6, False),
+               (R_HI, "정상범위 상한", f"=$C${R_MD}+$C${R_MK}*$C${R_MA}", R_N6, False),
+               (R_EX, "제외 개수",
+                f"=COUNT({D1}:{DN})-COUNT($G${R0+1}:$G${last})", R_N0, False),
+               (R_SD, "일 변동성", f"=STDEV.S($G${R0+1}:$G${last})", R_P4, False),
+               (R_AN, "연 변동성", f"=$C${R_SD}*SQRT($C${R_TD})", R_P2, False)]
+        for rr, k, v, fm, inp in lab:
+            fin = (rr == R_AN)
+            put(W, rr, 2, k, bold=True, border=True,
+                fill=(YEL if inp else (RPT["warm"] if fin else RPT["light"])))
+            put(W, rr, 3, v, fmt=fm, border=True, align="right", bold=fin,
+                fill=(YEL if inp else (RPT["warm"] if fin else None)))
+        note(W, R_AN+1, "MAD 는 중앙값 절대편차에 1.4826 을 곱해 정규분포의 표준편차와 "
+                        "눈금을 맞춘 값이다. 중앙값과 MAD 는 제외 전 전체 수익률로 구하고, "
+                        "표준편차만 채택분으로 구한다.", span=6)
+        cols(W, HDR, ["일자", "종가", "로그수익률", "|편차|", "채택", "채택 수익률"],
+             [15, 13, 14, 13, 9, 14])
+        for i, (d, v) in enumerate(px):
+            rr = R0 + i
+            put(W, rr, 2, (dt.date.fromisoformat(d) if d else None),
+                fmt=R_YMD, border=True, align="center")
+            put(W, rr, 3, v, fmt=R_N2, border=True, align="right")
+            if i == 0: continue
+            put(W, rr, 4, f"=LN(C{rr}/C{rr-1})", fmt=R_N6, border=True, align="right")
+            put(W, rr, 5, f"=ABS(D{rr}-$C${R_MD})", fmt=R_N6, border=True, align="right")
+            put(W, rr, 6, f"=IF($C${R_DR}=0,1,"
+                          f"IF(AND(D{rr}>=$C${R_LO},D{rr}<=$C${R_HI}),1,0))",
+                fmt=R_N0, border=True, align="center")
+            put(W, rr, 7, f'=IF(F{rr}=1,D{rr},"")', fmt=R_N6, border=True, align="right")
+
+    # ── 종합 ──
+    if many:
+        S = sheet("종합", tab=RPT["green"], widths=[8, 26, 18, 14, 12])
+        head(S, 2, "피어 종합",
+             "비상장이라 대상회사 주가가 없을 때, 유사기업의 변동성을 모아 하나로 줄인다.",
+             span=5)
+        fn = {"median": "MEDIAN", "mean": "AVERAGE",
+              "max": "MAX", "min": "MIN"}.get(pick, "MEDIAN")
+        r1, r2 = 9, 9 + len(series) - 1
+        put(S, 5, 2, "종합 방법", bold=True, border=True, fill=YEL)
+        put(S, 5, 3, PICKS.get(pick, pick), border=True, fill=YEL)
+        put(S, 6, 2, "적용 변동성", bold=True, border=True, fill=RPT["warm"])
+        put(S, 6, 3, f"={fn}($E${r1}:$E${r2})", fmt=R_P2, bold=True,
+            border=True, align="right", fill=RPT["warm"])
+        cols(S, 8, ["번호", "회사", "시트", "연 변동성", "수익률"], [8, 26, 18, 14, 12])
+        for i, ((nm, px), sn) in enumerate(zip(series, names)):
+            rr = r1 + i
+            put(S, rr, 2, i+1, fmt=R_N0, border=True, align="center")
+            put(S, rr, 3, nm, border=True)
+            put(S, rr, 4, sn, border=True, size=9, color=RPT["grey"])
+            put(S, rr, 5, f"='{sn}'!$C${R_AN}", fmt=R_P2, border=True, align="right")
+            put(S, rr, 6, f"='{sn}'!$C${R_NR}", fmt=R_N0, border=True, align="right")
+        note(S, r2+2, "중앙값은 한 회사의 급등락에 덜 흔들린다. 평균을 쓰려면 왜 그 "
+                      "회사들이 대상회사와 같은 위험을 진다고 보는지 조서에 남긴다. "
+                      "업종·규모·상장기간이 크게 다른 회사는 빼는 편이 낫다.", span=5)
+    return _save(wb)
+
+
+def _vsafe(s):
+    """시트 이름에 쓸 수 없는 글자를 턴다."""
+    out = "".join(c for c in str(s) if c not in r'[]:*?/\\')
+    return out.strip() or "계열"
+
+
+def polish_wb(wb):
+    """조서·리포트 마무리. 탭 색으로 갈래를 나누고 인쇄를 폭 맞춤으로 둔다.
+
+    시트가 스무 장을 넘으면 탭 이름만으로는 어디가 어딘지 안 보인다.
+    입력(노랑) · 트리(회색) · 결과(초록) · 회계(빨강)로 갈라 놓는다.
+    """
+    tone = {"해설": RPT["ink"], "가정": RPT["amber"], "도달확률": "9AA4AE",
+            "결과": RPT["green"], "회계처리": RPT["red"],
+            "상각표": RPT["sub"], "이자율곡선": RPT["sub"], "표지": RPT["ink"]}
+    for ws in wb.worksheets:
+        nm = ws.title
+        if ws.sheet_properties.tabColor is None:
+            ws.sheet_properties.tabColor = tone.get(
+                nm, "B7C0CC" if nm[:2].isdigit() else RPT["sub"])
+        try:
+            ws.page_setup.orientation = "landscape"
+            ws.page_setup.fitToWidth = 1
+            ws.page_setup.fitToHeight = 0
+            ws.sheet_properties.pageSetUpPr.fitToPage = True
+            ws.print_options.horizontalCentered = True
+            ws.oddHeader.left.text = nm
+            ws.oddHeader.left.size = 9
+            ws.oddHeader.left.color = "7F7F7F"
+            ws.oddFooter.right.text = "&P / &N"
+            ws.oddFooter.right.size = 9
+        except Exception:
+            pass
+    if wb.worksheets: wb.active = 0
+    return wb
+
+
+def _save(wb):
+    polish_wb(wb)
+    buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
+
+
+def build_xlsx_rate(tm: Terms):
+    """선도이자율 산출내역 리포트.
+
+    만기수익률 곡선 → 선형보간 → 부트스트래핑 → 연속복리 현물 → 구간 선도.
+    조서 트리 시트 11·12행에 값으로 박히는 선도이자율이 어디서 나왔는지
+    한 장씩 펼쳐 보여 준다. 노란 셀을 고치면 끝까지 따라 움직인다.
+    """
+    from openpyxl import Workbook
+    wb = Workbook(); wb.remove(wb.active)
+    K = report_kit(wb)
+    put, head, sec, cols, note, sheet = (K[x] for x in
+        ("put", "head", "sec", "cols", "note", "sheet"))
+    YEL = "FFF9DB"
+    derive(tm)
+    n, T = int(tm.n), tm.T
+    dt_ = T/n
+    cc = credit_curve(tm)
+    if len(tm.rf_curve) < 2 or len(cc) < 2:
+        raise ValueError("무위험·위험 곡선을 각각 두 점 이상 넣어야 합니다.")
+    spot_in = (tm.y_type == "spot")
+    IN = "입력곡선"
+    R0IN = 8                                   # 입력곡선 첫 자료행
+    LEG = [("무위험", tm.rf_curve, int(tm.cmp_rf), "B", "C"),
+           ("위험", cc, int(tm.cmp_cr), "E", "F")]
+
+    # ── 표지 ──
+    C = sheet("표지", tab=RPT["ink"], widths=[26, 22, 18, 18, 16, 16, 16, 16])
+    head(C, 2, "이자율 산출내역",
+         "만기수익률 곡선에서 할인계수를 순차로 풀고(부트스트래핑), 연속복리 "
+         "현물이자율로 바꾼 뒤, 격자 한 구간의 선도이자율을 뽑는 과정이다. "
+         "조서 트리 시트 11·12행에 값으로 들어가는 숫자가 여기서 나온다.")
+    r = 5
+    sec(C, r, "방법"); r += 1
+    cols(C, r, ["단계", "내용"], [26, 64]); r += 1
+    steps = ([("1. 입력", "현물이자율(제로커브)을 고시된 그대로 받는다"),
+              ("2. 연속환산", "연속 = m · ln(1 + r ÷ m).  복리 횟수 m 을 무시하고 "
+                            "ln(1+r) 로만 바꾸면 할인계수와 위험중립확률이 어긋난다"),
+              ("3. 보간", "고시 만기 사이는 직선으로 잇는다"),
+              ("4. 선도", "f(t₀,t₁) = [ r(t₁)·t₁ − r(t₀)·t₀ ] ÷ (t₁ − t₀)")]
+             if spot_in else
+             [("1. 입력", "만기수익률(YTM) 곡선. 고시 만기 사이는 직선으로 잇는다"),
+              ("2. 부트스트래핑", "1 = c·(DF₁+…+DF_k) + DF_k 를 앞에서부터 순차로 푼다. "
+                               "c 는 그 만기 수익률 ÷ 연 이표 횟수"),
+              ("3. 현물", "연속복리 현물  r(t) = −ln(DF) ÷ t"),
+              ("4. 선도", "f(t₀,t₁) = [ r(t₁)·t₁ − r(t₀)·t₀ ] ÷ (t₁ − t₀)")])
+    for k, v in steps:
+        put(C, r, 2, k, bold=True, border=True, fill=RPT["light"])
+        put(C, r, 3, v, border=True, wrap=True)
+        C.merge_cells(start_row=r, start_column=3, end_row=r, end_column=8)
+        C.row_dimensions[r].height = 30
+        r += 1
+    r += 1
+    sec(C, r, "설정"); r += 1
+    cols(C, r, ["항목", "값"], [26, 24]); r += 1
+    for k, v in [("입력 유형", "현물이자율(제로커브)" if spot_in else "만기수익률(YTM)"),
+                 ("무위험 복리 횟수 (연)", int(tm.cmp_rf)),
+                 ("위험 복리 횟수 (연)", int(tm.cmp_cr)),
+                 ("위험 곡선", "등급 보간" if tm.rate_mode == "rating" else "직접 입력"),
+                 ("평가기준일", tm.d_base), ("만기일", tm.d_mat),
+                 ("잔존기간 T (년)", round(T, 8)), ("노드 수 n", n),
+                 ("한 구간 Δt (년)", round(dt_, 8)),
+                 ("변동성 σ", tm.sig)]:
+        put(C, r, 2, k, bold=True, border=True, fill=RPT["light"])
+        put(C, r, 3, v, border=True, fmt=(R_P2 if k == "변동성 σ" else None),
+            align=None if isinstance(v, str) else "right")
+        r += 1
+    r += 1
+    note(C, r, "노란 셀만 입력이다. 만기와 수익률을 고치면 부트스트래핑부터 선도까지 "
+               "전부 다시 계산된다. 다만 만기 칸을 늘리거나 줄이려면 앱에서 곡선을 "
+               "바꿔 리포트를 다시 만들어야 한다 — 표의 길이는 구조라 수식으로 늘지 않는다.")
+
+    # ── 입력곡선 ──
+    I = sheet(IN, widths=[12, 16, 15, 5, 12, 16, 15])
+    head(I, 2, "입력 곡선", "고시된 그대로 적는다. 이 두 표가 리포트 전체의 뿌리다.",
+         span=7)
+    cols(I, R0IN-1, ["무위험 만기", "수익률", "연속환산", "",
+                     "위험 만기", "수익률", "연속환산"],
+         [12, 16, 15, 5, 12, 16, 15])
+    for (lbl, pts, cmp_, mcol, ycol) in LEG:
+        for i, (mt, y) in enumerate(pts):
+            rr = R0IN + i
+            put(I, rr, 2 if mcol == "B" else 5, mt, fmt="0.####",
+                border=True, align="right", fill=YEL)
+            put(I, rr, 3 if mcol == "B" else 6, y, fmt=R_P4,
+                border=True, align="right", fill=YEL)
+            put(I, rr, 4 if mcol == "B" else 7,
+                f"={cmp_}*LN(1+{ycol}{rr}/{cmp_})", fmt=R_P4,
+                border=True, align="right")
+    endr = R0IN + max(len(tm.rf_curve), len(cc)) + 1
+    note(I, endr, "연속환산 열은 참고다. 만기수익률을 넣었다면 실제 계산은 다음 두 "
+                  "시트의 부트스트래핑에서 하고, 현물이자율을 넣었다면 이 열이 곧 "
+                  "쓰이는 값이다.", span=7)
+
+    # ── 곡선별 산출 ──
+    made = {}
+    for (lbl, pts, cmp_, mcol, ycol) in LEG:
+        sn = f"{lbl} 산출"
+        W = sheet(sn, widths=[8, 13, 15, 13, 15, 15, 15], freeze="B9")
+        R0 = 9
+        if spot_in:
+            head(W, 2, f"{lbl} — 현물이자율 연속환산", span=6)
+            put(W, 5, 2, "연속 = m · ln(1 + r ÷ m)", bold=True, color=RPT["sub"])
+            put(W, 6, 2, f"m = {cmp_}  (책 3.7.4.4)", color=RPT["grey"], size=9)
+            cols(W, R0-1, ["번호", "만기 t", "고시 수익률", "연속복리 현물"],
+                 [8, 13, 16, 16])
+            for i, (mt, y) in enumerate(pts):
+                rr = R0 + i
+                put(W, rr, 2, i+1, fmt=R_N0, border=True, align="center")
+                put(W, rr, 3, f"='{IN}'!${mcol}${R0IN+i}", fmt="0.####",
+                    border=True, align="right")
+                put(W, rr, 4, f"='{IN}'!${ycol}${R0IN+i}", fmt=R_P4,
+                    border=True, align="right")
+                put(W, rr, 5, f"={cmp_}*LN(1+D{rr}/{cmp_})", fmt=R_P4,
+                    border=True, align="right")
+            # 보간에 쓸 표 — (만기, 현물) 이 C·E 열에 있다
+            grid = [(mt, None) for mt, _ in pts]
+            made[lbl] = dict(sh=sn, r0=R0, tcol="C", rcol="E", pts=grid)
+            note(W, R0+len(pts)+1, "고시 만기 사이는 다음 시트에서 직선으로 잇는다.",
+                 span=6)
+        else:
+            head(W, 2, f"{lbl} — 부트스트래핑", span=7)
+            put(W, 5, 2, "1 = c · (DF₁ + … + DF_k) + DF_k", bold=True, color=RPT["sub"])
+            put(W, 6, 2, f"c = 그 만기 수익률 ÷ {cmp_}   (연 {cmp_}회 이표 가정) · "
+                         f"현물 = −ln(DF) ÷ t", color=RPT["grey"], size=9)
+            cols(W, R0-1, ["k", "만기 t", "보간 수익률", "c", "누적 DF", "DF",
+                           "현물 (연속)"], [8, 13, 15, 13, 15, 15, 15])
+            N = max(1, int(math.ceil(T*cmp_)))
+            for k in range(1, N+1):
+                rr, t_ = R0 + k - 1, k/cmp_
+                put(W, rr, 2, k, fmt=R_N0, border=True, align="center")
+                put(W, rr, 3, round(t_, 12), fmt="0.0000", border=True, align="right")
+                put(W, rr, 4, lerp_formula(t_, pts, ycol, R0IN, IN), fmt=R_P4,
+                    border=True, align="right")
+                put(W, rr, 5, f"=D{rr}/{cmp_}", fmt=R_N6, border=True, align="right")
+                put(W, rr, 6, ("=0" if k == 1 else f"=F{rr-1}+G{rr-1}"),
+                    fmt=R_N6, border=True, align="right")
+                put(W, rr, 7, f"=(1-E{rr}*F{rr})/(1+E{rr})", fmt=R_N6,
+                    border=True, align="right")
+                put(W, rr, 8, f"=-LN(G{rr})/C{rr}", fmt=R_P4, border=True, align="right")
+            # 보간에 쓸 표 — 만기는 C, 현물은 H 열
+            made[lbl] = dict(sh=sn, r0=R0, tcol="C", rcol="H",
+                             pts=[(k/cmp_, None) for k in range(1, N+1)])
+            note(W, R0+N+1, "DF 는 앞 회차 결과를 이어 받는다. 첫 줄의 누적 DF 가 0 인 "
+                            "것은 그 앞에 이표가 없기 때문이다.", span=7)
+
+    # ── 선도이자율 ──
+    def spot_ref(leg, t):
+        """산출 시트의 현물 표에서 t 의 값을 뽑는 수식."""
+        d = made[leg]
+        pts = [(x, 0.0) for x, _ in d["pts"]]
+        return lerp_formula(t, pts, d["rcol"], d["r0"], d["sh"])
+
+    F = sheet("선도이자율", tab=RPT["green"],
+              widths=[8, 13, 13, 14, 14, 14, 14, 14, 14, 14, 12],
+              freeze="B10", landscape=True)
+    head(F, 2, "구간 선도이자율",
+         "격자 한 칸을 건너갈 때 쓰는 이자율이다. 조서 트리 시트의 11행(무위험)과 "
+         "12행(위험)에 이 값이 그대로 들어간다.", span=11)
+    put(F, 5, 2, "f(t₀,t₁) = [ r(t₁)·t₁ − r(t₀)·t₀ ] ÷ (t₁ − t₀)",
+        bold=True, color=RPT["sub"])
+    put(F, 6, 2, "q = [ exp(f_무위험 · Δt) − d ] ÷ (u − d),   u = exp(σ√Δt),  d = 1/u",
+        color=RPT["grey"], size=9)
+    put(F, 7, 2, "Δt", bold=True, border=True, fill=RPT["light"])
+    put(F, 7, 3, round(dt_, 12), fmt="0.00000000", border=True, align="right")
+    put(F, 7, 4, "σ", bold=True, border=True, fill=YEL)
+    put(F, 7, 5, tm.sig, fmt=R_P2, border=True, align="right", fill=YEL)
+    put(F, 7, 6, "u", bold=True, border=True, fill=RPT["light"])
+    put(F, 7, 7, "=EXP($E$7*SQRT($C$7))", fmt=R_N6, border=True, align="right")
+    put(F, 7, 8, "d", bold=True, border=True, fill=RPT["light"])
+    put(F, 7, 9, "=1/$G$7", fmt=R_N6, border=True, align="right")
+    cols(F, 9, ["스텝", "t₀", "t₁", "무위험 r(t₀)", "무위험 r(t₁)", "무위험 선도",
+                "위험 r(t₀)", "위험 r(t₁)", "위험 선도", "스프레드", "q"],
+         [8, 13, 13, 14, 14, 14, 14, 14, 14, 14, 12])
+    for i in range(n):
+        rr = 10 + i
+        t0, t1 = i*dt_, (i+1)*dt_
+        put(F, rr, 2, i, fmt=R_N0, border=True, align="center")
+        put(F, rr, 3, round(t0, 12), fmt="0.000000", border=True, align="right")
+        put(F, rr, 4, round(t1, 12), fmt="0.000000", border=True, align="right")
+        put(F, rr, 5, spot_ref("무위험", t0), fmt=R_P4, border=True, align="right")
+        put(F, rr, 6, spot_ref("무위험", t1), fmt=R_P4, border=True, align="right")
+        put(F, rr, 7, f"=(F{rr}*D{rr}-E{rr}*C{rr})/(D{rr}-C{rr})", fmt=R_P4,
+            border=True, align="right", bold=True)
+        put(F, rr, 8, spot_ref("위험", t0), fmt=R_P4, border=True, align="right")
+        put(F, rr, 9, spot_ref("위험", t1), fmt=R_P4, border=True, align="right")
+        put(F, rr, 10, f"=(I{rr}*D{rr}-H{rr}*C{rr})/(D{rr}-C{rr})", fmt=R_P4,
+            border=True, align="right", bold=True)
+        put(F, rr, 11, f"=J{rr}-G{rr}", fmt=R_P4, border=True, align="right")
+        put(F, rr, 12, f"=(EXP(G{rr}*$C$7)-$I$7)/($G$7-$I$7)", fmt=R_N4,
+            border=True, align="right")
+    note(F, 10+n+1, "스프레드가 음수인 줄이 있으면 두 곡선을 바꿔 넣은 것이다. "
+                    "q 가 0 과 1 밖으로 나가면 변동성이 너무 낮거나 노드가 너무 성긴 "
+                    "것이다 — 격자가 무차익 조건을 못 맞춘다.", span=11)
+    return _save(wb)
 
 
 # ══════════════════════════════════════════════════════════
@@ -1323,6 +1899,7 @@ def build_xlsx(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     for i in range(4, r):
         H.cell(row=i, column=3).alignment = Alignment(horizontal="left", vertical="center")
 
+    polish_wb(wb)
     bio = io.BytesIO(); wb.save(bio); bio.seek(0)
     return bio.getvalue()
 
@@ -2190,6 +2767,7 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     for i in range(4, r):
         H.cell(row=i, column=3).alignment = Alignment(horizontal="left", vertical="center")
 
+    polish_wb(wb)
     bio = io.BytesIO(); wb.save(bio); bio.seek(0)
     return bio.getvalue()
 
@@ -2210,6 +2788,7 @@ st.caption("계약조건과 시장자료를 넣으면 이항격자로 옵션을 
 
 if "tm" not in st.session_state: st.session_state.tm = Terms()
 if "prices" not in st.session_state: st.session_state.prices = []
+if "peers" not in st.session_state: st.session_state.peers = []
 
 with st.sidebar:
     st.subheader("계약조건")
@@ -2334,7 +2913,9 @@ with st.sidebar:
         tdays = int(c4.number_input("연 거래일수", value=250, step=5))
         st.caption("야후 파이낸스 수정주가를 씁니다. 유상증자·액면분할·배당이 반영된 종가입니다.")
         asof = st.date_input("조회 종료일", value=dt.date.today())
-        drop = st.checkbox("이상치 제거 (중앙값 절대편차 3배)", value=True)
+        drop = st.checkbox("이상치 제거 (중앙값 절대편차 2.5배)", value=True,
+                           help="MAD × 1.4826 × 2.5 밖의 일간수익률을 뺍니다. "
+                                "책 사례 5-2 와 같은 배수입니다.")
         if st.button("주가 수집", use_container_width=True, type="secondary"):
             with st.spinner("받는 중"):
                 try:
@@ -2371,6 +2952,74 @@ with st.sidebar:
                               if v['removed'] else ""))
                 if st.button("이 변동성 적용", use_container_width=True, type="primary"):
                     t.sig = v["annual"]
+
+        st.divider()
+        st.markdown("**비상장 — 피어로 산출**")
+        st.caption("대상회사 주가가 없으면 유사기업 여럿의 변동성을 모아 씁니다. "
+                   "업종·규모·상장기간이 비슷한 회사를 고르고, 왜 골랐는지 조서에 남기십시오.")
+        ptxt = st.text_area("피어 목록 — 한 줄에 하나, `코드` 또는 `코드,이름`",
+                            value=st.session_state.get("peer_txt", ""),
+                            height=90, placeholder="122870,와이지엔터\n035900,JYP\n041510,SM")
+        st.session_state.peer_txt = ptxt
+        pc1, pc2 = st.columns(2)
+        pmkt = pc1.selectbox("피어 시장", ["KQ", "KS", ""], index=0, key="pmkt",
+                             format_func=lambda x: {"KQ": "코스닥", "KS": "코스피",
+                                                    "": "해외"}[x])
+        vpick = pc2.selectbox("종합 방법", ["median", "mean", "max", "min"],
+                             format_func=lambda x: {"median": "중앙값", "mean": "단순평균",
+                                                    "max": "최댓값", "min": "최솟값"}[x])
+        if st.button("피어 주가 수집", use_container_width=True):
+            got, fail = [], []
+            with st.spinner("받는 중"):
+                for line in ptxt.splitlines():
+                    line = line.strip()
+                    if not line: continue
+                    parts = [x.strip() for x in line.replace("\t", ",").split(",")]
+                    code = parts[0]
+                    nm = parts[1] if len(parts) > 1 and parts[1] else code
+                    try:
+                        rows, _src = fetch_prices(code, pdays, pmkt, asof.isoformat())
+                        got.append((nm, rows))
+                    except Exception as ex:
+                        fail.append(f"{nm} — {ex}")
+            st.session_state.peers = got
+            if got: st.success(f"{len(got)}개 수집 · " + " · ".join(n for n, _ in got))
+            if fail: st.error("못 받은 것: " + " / ".join(fail))
+        mf = st.file_uploader("여러 종목 종가 파일 (첫 열 일자, 나머지 열 종목)",
+                              type=["xlsx", "xlsm", "csv", "txt", "tsv"], key="mpxf")
+        if mf is not None:
+            try:
+                got = parse_prices_multi(read_upload(mf.name, mf.getvalue()))
+            except Exception as ex:
+                st.error(str(ex))
+            else:
+                if got:
+                    st.session_state.peers = got
+                    st.success(f"{mf.name} · {len(got)}개 — "
+                               + " · ".join(n for n, _ in got))
+                else:
+                    st.error("종목별 종가를 찾지 못했습니다. 첫 줄이 머리글이고 "
+                             "첫 열이 일자인지 확인하십시오.")
+        peers = st.session_state.get("peers") or []
+        if peers:
+            pv = [(nm, vol_from(px, tdays, drop)) for nm, px in peers]
+            pv = [(nm, x) for nm, x in pv if x]
+            if pv:
+                ann = sorted(x["annual"] for _, x in pv)
+                agg = {"median": (ann[len(ann)//2] if len(ann) % 2
+                                  else (ann[len(ann)//2-1]+ann[len(ann)//2])/2),
+                       "mean": sum(ann)/len(ann), "max": ann[-1], "min": ann[0]}[vpick]
+                st.dataframe(pd.DataFrame(
+                    [[nm, x["annual"], x["n"], x["removed"]] for nm, x in pv],
+                    columns=["회사", "연 변동성", "수익률", "제외"]).style.format(
+                    {"연 변동성": "{:.2%}"}), use_container_width=True, hide_index=True)
+                st.metric("피어 종합", f"{agg*100:.2f}%",
+                          {"median": "중앙값", "mean": "단순평균",
+                           "max": "최댓값", "min": "최솟값"}[vpick])
+                if st.button("피어 종합 적용", use_container_width=True, type="primary"):
+                    t.sig = agg
+        st.session_state.vol_opt = dict(tdays=tdays, drop=drop, pick=vpick,
+                                        asof=asof.isoformat())
         t.sig = st.number_input("변동성 (%)", value=t.sig*100, step=0.5)/100
 
     with st.expander("이자율", expanded=True):
@@ -2646,6 +3295,12 @@ with tabs[4]:
     import matplotlib.pyplot as plt
     from matplotlib.colors import ListedColormap
     from matplotlib.patches import Patch
+    # 한글 글꼴이 없으면 글자가 네모로 나온다. 찾으면 쓰고, 없으면 영문으로 그린다.
+    _kf = use_korean_font()
+    _L = (dict(x="스텝", y="주가 수준",
+               lg=["전환", "조기상환", "매도청구", "보유", "만기상환"]) if _kf else
+          dict(x="step", y="stock level",
+               lg=["Convert", "Put", "Call", "Hold", "Redeem"]))
     n = t.n
     idx = {}
     for k, v in full["memo"].items():
@@ -2658,13 +3313,16 @@ with tabs[4]:
     cmap = ListedColormap(["#1b6b5a", "#7a4b1e", "#a3312a", "#e4e8ec", "#9aa4ae"])
     fig, ax = plt.subplots(figsize=(11, 3.6))
     ax.imshow(grid, aspect="auto", cmap=cmap, vmin=0.5, vmax=5.5, interpolation="nearest")
-    ax.set_xlabel("스텝"); ax.set_ylabel("주가 수준")
+    ax.set_xlabel(_L["x"]); ax.set_ylabel(_L["y"])
     ax.set_yticks([]); ax.spines[["top", "right"]].set_visible(False)
     ax.legend(handles=[Patch(facecolor=c, label=l) for c, l in
                        zip(["#1b6b5a", "#7a4b1e", "#a3312a", "#e4e8ec", "#9aa4ae"],
-                           ["전환", "조기상환", "매도청구", "보유", "만기상환"])],
+                           _L["lg"])],
               loc="upper center", bbox_to_anchor=(0.5, -0.22), ncol=5, frameon=False)
     st.pyplot(fig, use_container_width=True)
+    if not _kf:
+        st.caption("한글 글꼴이 없어 그림만 영문으로 그렸습니다. 표와 설명은 그대로입니다. "
+                   "서버에 `fonts-nanum` 을 설치하면 한글로 나옵니다.")
     D = full["dist"]; tot = D["conv"]+D["put"]+D["call"]+D["mat"] or 1
     st.dataframe(pd.DataFrame([
         ["전환", D["conv"]/tot, D["tc"]/D["conv"]/full["mper"] if D["conv"] else None],
@@ -2823,3 +3481,57 @@ with tabs[8]:
                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                            type="primary", key="dl_report", use_container_width=True)
         st.caption("버튼이 보이지 않거나 눌러도 반응이 없으면 브라우저의 팝업·다운로드 차단을 확인하십시오.")
+
+    st.divider()
+    st.subheader("부속 리포트")
+    st.write("평가 인풋이 어디서 나왔는지 보여 주는 산출내역입니다. 조서와 함께 철하면 "
+             "감사인이 인풋까지 따라올 수 있습니다. 둘 다 계산이 수식으로 들어갑니다.")
+    MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+    rc1, rc2 = st.columns(2)
+    with rc1:
+        st.markdown("**변동성 산출내역**")
+        _peers = st.session_state.get("peers") or []
+        _own = st.session_state.get("prices") or []
+        _opt = st.session_state.get("vol_opt") or {}
+        if _peers:
+            st.caption(f"피어 {len(_peers)}개로 만듭니다 — "
+                       + " · ".join(n for n, _ in _peers))
+        elif _own:
+            st.caption(f"대상회사 종가 {len(_own)}개로 만듭니다 "
+                       f"({st.session_state.get('px_src', '')}).")
+        else:
+            st.caption("먼저 왼쪽 변동성 칸에서 주가를 수집하거나 파일을 넣으십시오.")
+        if st.button("변동성 리포트 만들기", use_container_width=True,
+                     disabled=not (_peers or _own)):
+            try:
+                ser = _peers or [(st.session_state.get("px_src") or "대상회사", _own)]
+                st.session_state.rep_vol = (
+                    f"변동성_산출내역_{dt.date.today()}.xlsx",
+                    build_xlsx_vol(ser, tdays=_opt.get("tdays", 250),
+                                   drop=_opt.get("drop", True),
+                                   pick=_opt.get("pick", "median"),
+                                   applied=t.sig,
+                                   asof=dt.date.fromisoformat(t.d_base)))
+            except Exception as ex:
+                st.error(f"만들지 못했습니다 — {ex}")
+        rv = st.session_state.get("rep_vol")
+        if rv:
+            st.download_button(f"{rv[0]}  ({len(rv[1])/1024:,.0f} KB)", rv[1], rv[0],
+                               MIME, key="dl_vol", use_container_width=True)
+
+    with rc2:
+        st.markdown("**이자율 산출내역**")
+        st.caption("입력 곡선 → 부트스트래핑 → 연속복리 현물 → 구간 선도. "
+                   "조서 트리 시트 11·12행의 값이 어디서 나왔는지 펼쳐 보여 줍니다.")
+        if st.button("이자율 리포트 만들기", use_container_width=True,
+                     disabled=not (len(t.rf_curve) >= 2 and len(credit_curve(t)) >= 2)):
+            try:
+                st.session_state.rep_rate = (
+                    f"이자율_산출내역_{dt.date.today()}.xlsx", build_xlsx_rate(t))
+            except Exception as ex:
+                st.error(f"만들지 못했습니다 — {ex}")
+        rr_ = st.session_state.get("rep_rate")
+        if rr_:
+            st.download_button(f"{rr_[0]}  ({len(rr_[1])/1024:,.0f} KB)", rr_[1], rr_[0],
+                               MIME, key="dl_rate", use_container_width=True)
