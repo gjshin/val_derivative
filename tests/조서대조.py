@@ -32,6 +32,20 @@ CASES = [
     ("방법2 · 전환권 부채", dict(k_method=2, conv_class="liability")),
     ("콜 내재파생 포함 · 자본", dict(k_sep=0)),
     ("콜 내재파생 포함 · 부채", dict(k_sep=0, conv_class="liability")),
+    # 아래 세 건은 리픽싱 주기가 2 스텝 이상이라야 살아나는 경로다.
+    # 다른 케이스는 노드가 성겨 주기가 1 스텝으로 뭉개지고, 그러면
+    # 이월 계산도 조정일 동점도 생기지 않아 오류를 통째로 비껴간다.
+    ("월 노드 · 리픽싱 7스텝", dict(_gap=1., d_issue="2025-05-23", d_base="2025-06-30",
+                              d_mat="2027-08-23", cv_s=12., cv_e=26., p_s=12., p_e=24.,
+                              k_s=6., k_e=18., k_lock=20., rfx_cyc=7.)),
+    ("월 노드 · 리픽싱 7스텝 · 방법1 · 부채",
+     dict(_gap=1., k_method=1, conv_class="liability", d_issue="2025-05-23",
+          d_base="2025-06-30", d_mat="2027-08-23", cv_s=12., cv_e=26., p_s=12.,
+          p_e=24., k_s=6., k_e=18., k_lock=20., rfx_cyc=7.)),
+    ("월 노드 · 리픽싱 7스텝 · GS",
+     dict(_gap=1., model="GS", d_issue="2025-05-23", d_base="2025-06-30",
+          d_mat="2027-08-23", cv_s=12., cv_e=26., p_s=12., p_e=24.,
+          k_s=6., k_e=18., k_lock=20., rfx_cyc=7.)),
 ]
 
 
@@ -45,12 +59,22 @@ def load_app():
 
 
 def _combin(f):
-    """formulas 는 COMBIN 을 구현하지 않는다. 인수가 모두 상수라 값으로 바꾼다.
+    """formulas 는 COMBIN 을 구현하지 않는다. 값으로 바꿔 우회한다.
 
     조서 자체는 정상이다. 엑셀은 COMBIN 을 계산한다. 검사 도구의 한계라
     여기서만 우회한다.
+
+    도달확률은 스텝(4행)과 하락 횟수(B열)를 참조하는 동적 형태다.
+    COMBIN(<열>$4, $B<행>) 의 열·행에서 스텝과 r 을 되짚어 상수로 만든다.
+    열 C 가 스텝 0, 5행이 r=0 이다.
     """
     import math
+    from openpyxl.utils import column_index_from_string as ci
+
+    def dyn(m):
+        return repr(math.comb(ci(m.group(1)) - 3, int(m.group(2)) - 5))
+
+    f = re.sub(r"COMBIN\(([A-Z]+)\$4,\$B(\d+)\)", dyn, f)
     return re.sub(r"COMBIN\((\d+),(\d+)\)",
                   lambda m: repr(math.comb(int(m.group(1)), int(m.group(2)))), f)
 
@@ -59,8 +83,11 @@ def build(G, over, path):
     T, derive, decompose = G["Terms"], G["derive"], G["decompose"]
     t = T(); t.rf_curve = [(1, .0226), (3, .0240), (5, .0252)]
     t.cr_curve = [(1, .1409), (3, .1740), (5, .1905)]
-    t.carry = 1; t.gap_m = 6.0
-    for k, v in over.items(): setattr(t, k, v)
+    # _gap 은 노드 간격만 바꾸는 검사용 키다. 리픽싱 주기가 살아나는
+    # 촘촘한 격자를 만들 때 쓴다.
+    t.carry = 1; t.gap_m = over.get("_gap", 6.0)
+    for k, v in over.items():
+        if k != "_gap": setattr(t, k, v)
     derive(t)
     full, b0, b1, b2, ca, conv = decompose(t)
     b3 = G["pick"](G["engine"](t, conv=True, put=True, call=True,

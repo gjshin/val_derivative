@@ -128,12 +128,20 @@ def terms(G, over):
 
 
 def _combin(f):
-    """formulas 는 COMBIN 을 구현하지 않는다. 인수가 모두 상수라 값으로 바꾼다.
+    """formulas 는 COMBIN 을 구현하지 않는다. 값으로 바꿔 우회한다.
 
     조서 자체는 정상이다. 엑셀은 COMBIN 을 계산한다. 검사 도구의 한계라
     여기서만 우회한다.
+
+    도달확률은 스텝(4행)과 하락 횟수(B열)를 참조하는 동적 형태다.
+    COMBIN(<열>$4, $B<행>) 의 열·행에서 스텝과 r 을 되짚는다. 열 C 가 스텝 0,
+    5행이 r=0 이다.
     """
     import math
+    from openpyxl.utils import column_index_from_string as ci
+
+    f = re.sub(r"COMBIN\(([A-Z]+)\$4,\$B(\d+)\)",
+               lambda m: repr(math.comb(ci(m.group(1)) - 3, int(m.group(2)) - 5)), f)
     return re.sub(r"COMBIN\((\d+),(\d+)\)",
                   lambda m: repr(math.comb(int(m.group(1)), int(m.group(2)))), f)
 
