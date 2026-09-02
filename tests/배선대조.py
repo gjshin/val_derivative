@@ -192,6 +192,25 @@ def main():
         print("   %-22s n=%2d  최대 차이 %s %.6f  %s"
               % (lbl, n, nm2 or "—", gap, "OK" if ok else "★"))
 
+    print("\n4. 상태확장을 골랐을 때 수식 조서가 그 사실을 밝히는가")
+    # 상태확장 격자는 재결합하지 않아 엑셀 트리로 못 옮긴다. 조서는 경로가중치로
+    # 다시 계산하므로 앱 값과 다르다. 그 차이를 조서가 스스로 적어야 한다.
+    for carry, lbl in ((0, "상태확장"), (1, "경로가중치"), (2, "확률가중"), (3, "특정노드")):
+        t = terms(G, carry=carry, rfx_mode=2, rfx_cyc=7., gap_m=3.)
+        full, b0, b1, b2, ca, conv = G["decompose"](t)
+        R = openpyxl.load_workbook(io.BytesIO(
+            G["build_xlsx_formula"](t, full, b0, b1, b2, ca, conv,
+                                    G["eir_table"](t, b0))))["결과"]
+        stamped, warned = R["C32"].value, bool(R["B33"].value)
+        if carry == 0:
+            ok = (stamped is not None and abs(stamped - b2) < 1e-9 and warned)
+            note = "앱 값 %.4f 기재 · 경고 %s" % (stamped or -1, "있음" if warned else "없음")
+        else:
+            ok = (stamped in (None, "") and not warned)
+            note = "해당 없음 (조서와 같은 방법)"
+        if not ok: bad += 1
+        print("   %-8s %-40s %s" % (lbl, note, "OK" if ok else "★"))
+
     print("\n" + ("배선 이상 없음" if bad == 0 else "★ %d건" % bad))
     return 0 if bad == 0 else 1
 
