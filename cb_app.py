@@ -531,6 +531,10 @@ def allocate(tm: Terms, full, b0, b1, b2, ca):
                    " 매도청구권은 발행회사만 행사할 수 있어 내재파생상품이므로 "
                    "조기상환권과 하나로 묶어 순액으로 봅니다 (문단 4.3.1 · B4.3.4)."))
     rows.append(("합계", sum(v for _, v in rows)))
+    if tm.elapsed_m > 0.01:
+        note += ("  ※ 이 배분은 **최초 인식**용입니다. 평가기준일이 발행일보다 뒤이므로 "
+                 "결산 회계처리에는 그대로 쓰지 마십시오. 결산일에 필요한 것은 파생상품의 "
+                 "공정가치뿐이고, 주계약은 발행일 배분액을 유효이자율로 상각한 장부금액입니다.")
     return rows, note
 
 
@@ -1132,6 +1136,10 @@ def build_xlsx(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         "전환권이 부채이면 전환권과 조기상환권은 상호의존적이므로 하나의 복합내재파생상품으로 "
         "전체로서 측정한다 (제1109호 문단 B4.3.4).",
         color=GREY, size=9)
+    if tm.elapsed_m > 0.01:
+        put(E, 4, 2, "※ 평가기준일이 발행일보다 뒤입니다. 아래 배분은 최초 인식용이므로 "
+            "결산 회계처리에 그대로 쓰지 마십시오. 결산일에 쓰는 것은 파생상품 공정가치뿐이고, "
+            "주계약은 발행일 배분액을 유효이자율로 상각한 장부금액입니다.", color=RED, size=9)
     sec(E, 5, "1. 최초 인식 배분", span=5)
     fac = tm.face_total
     for i, h in enumerate(["항목", "100 기준", "전액 기준 (원)"]):
@@ -1916,6 +1924,10 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         "전환권이 부채이면 전환권과 조기상환권은 상호의존적이므로 하나의 복합내재파생상품으로 "
         "전체로서 측정한다 (제1109호 문단 B4.3.4).",
         color=GREY, size=9)
+    if tm.elapsed_m > 0.01:
+        put(E, 4, 2, "※ 평가기준일이 발행일보다 뒤입니다. 아래 배분은 최초 인식용이므로 "
+            "결산 회계처리에 그대로 쓰지 마십시오. 결산일에 쓰는 것은 파생상품 공정가치뿐이고, "
+            "주계약은 발행일 배분액을 유효이자율로 상각한 장부금액입니다.", color=RED, size=9)
     sec(E, 5, "1. 최초 인식 배분", span=5)
     for i, h in enumerate(["항목", "100 기준", "전액 기준 (원)"]):
         put(E, 6, 2+i, h, bold=True, fill=LIGHT, align="center", border=True, size=9)
