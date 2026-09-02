@@ -73,6 +73,11 @@ CASES = [
     # 모형·분류
     ("변동성 25%", dict(sig=.25), None),
     ("GS", dict(model="GS"), None),
+    ("콜 내재파생 포함", dict(k_sep=0),
+     "트랜치·주계약·부채요소·매도청구권은 그대로다. 바뀌는 것은 배분표와 분개이고 "
+     "그 둘은 매 케이스마다 따로 확인한다."),
+    ("콜 내재파생 포함 · 부채", dict(k_sep=0, conv_class="liability"),
+     "위와 같다. 전환권 분류까지 바꿔도 트랜치 다섯 값은 움직이지 않는다."),
     ("전환권 부채", dict(conv_class="liability"),
      "트랜치·주계약·부채요소·매도청구권은 그대로다. 바뀌는 것은 배분표와 분개이고 "
      "그 둘은 매 케이스마다 따로 확인한다."),
@@ -133,7 +138,8 @@ def build(G, over, path):
     b3 = G["pick"](G["engine"](t, conv=True, put=True, call=True,
                                conv_start=max(t.cv_s, t.k_lock)), t.model)
     open(path, "wb").write(
-        G["build_xlsx_formula"](t, full, b0, b1, b2, ca, conv, G["eir_table"](t, b0)))
+        G["build_xlsx_formula"](t, full, b0, b1, b2, ca, conv,
+                                G["eir_table"](t, G["acc_host"](t, full, b0, b1, b2, ca))))
     import openpyxl
     wb = openpyxl.load_workbook(path)
     mp = {nm: f"S{i:02d}" for i, nm in enumerate(wb.sheetnames)}
@@ -147,7 +153,11 @@ def build(G, over, path):
                     c.value = _combin(f)
     for o, nn in mp.items(): wb[o].title = nn
     wb.save(path)
+    # 분개 차변은 배분표의 음수 항목이 넘어온 것이다. 콜을 내재파생에 넣으면
+    # 자산 줄이 사라져 100 이 되고, 파생 순액이 자산이면 그 줄이 대신 차변으로 간다.
+    al = G["allocate"](t, full, b0, b1, b2, ca)[0]
     return dict(b2=b2, b3=b3, b0=b0, b1=b1, ca=ca, conv=conv,
+                dr_want=100 + sum(-v for _, v in al[:-1] if v < 0),
                 eq=(t.conv_class == "equity")), mp["결과"], mp["회계처리"]
 
 
@@ -183,7 +193,7 @@ def run_one(idx):
         path = os.path.join(d, "wb.xlsx")
         eng, res, acc = build(G, over, path)
         got = solve(path, (res, acc))
-    out = {"lbl": lbl, "why": why, "ca": eng["ca"],
+    out = {"lbl": lbl, "why": why, "ca": eng["dr_want"],
            "vals": [got[res].get(c) for _, c, _ in ROWS],
            "want": [eng[k] for _, _, k in ROWS],
            "alloc": got[acc].get("C12"),
@@ -219,7 +229,7 @@ def main():
             ok = False; bad.append(f"{lbl} · 배분 합계: {o['alloc']}")
         if (o["dr"] is None or o["cr"] is None
                 or abs(o["dr"] - o["cr"]) > 1e-4
-                or abs(o["dr"] - (100 + eng_ca)) > 1e-4):
+                or abs(o["dr"] - eng_ca) > 1e-4):
             ok = False; bad.append(f"{lbl} · 분개 대차: {o['dr']} / {o['cr']}")
         g = o["gap"]
         if g not in base:

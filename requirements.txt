@@ -5,3 +5,4 @@ matplotlib>=3.8
 openpyxl>=3.1
 # pykrx 는 스트림릿 클라우드에서 설치가 자주 실패해 뺐다
 yfinance>=0.2.40
+xlrd>=2.0
