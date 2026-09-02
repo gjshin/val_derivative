@@ -25,10 +25,11 @@ def load_app():
     return m.__dict__
 
 
-CASES = [(cls, km, md)
+CASES = [(cls, km, md, ks)
          for cls in ("equity", "liability")
          for km in (0, 1, 2)
-         for md in ("TF", "GS")]
+         for md in ("TF", "GS")
+         for ks in (1, 0)]
 
 
 def main():
@@ -43,20 +44,22 @@ def main():
                  "OK" if ok else "★"))
         if not ok: bad.append(tag)
 
-    for cls, km, md in CASES:
+    for cls, km, md, ks in CASES:
         t = G["Terms"]()
         t.rf_curve = [(1, .0226), (3, .0240), (5, .0252)]
         t.cr_curve = [(1, .1409), (3, .1740), (5, .1905)]
-        t.conv_class, t.k_method, t.model = cls, km, md
+        t.conv_class, t.k_method, t.model, t.k_sep = cls, km, md, ks
         t.face_total = 9_000_000_000
         G["derive"](t)
         full, b0, b1, b2, ca, conv = G["decompose"](t)
         rows, _ = G["allocate"](t, full, b0, b1, b2, ca)
+        # 앱과 같은 경로로 만든다. 상각표는 이론적 주계약이 아니라 인식액에서 출발한다.
+        host = G["acc_host"](t, full, b0, b1, b2, ca)
         wb = openpyxl.load_workbook(io.BytesIO(
-            G["build_xlsx"](t, full, b0, b1, b2, ca, conv, G["eir_table"](t, b0))),
+            G["build_xlsx"](t, full, b0, b1, b2, ca, conv, G["eir_table"](t, host))),
             data_only=True)
         E, R = wb["회계처리"], wb["결과"]
-        print(f"\n[{cls} · 방법{km} · {md}]")
+        print(f"\n[{cls} · 방법{km} · {md} · {'별도' if ks else '내재파생'}]")
         # 결과 시트 · 순차 차감
         for i, (nm, v) in enumerate([("B0 주계약", b0), ("B1 부채요소", b1),
                                      ("B2 전체", b2), ("B3 매도청구 반영", b2-ca)]):
@@ -71,15 +74,22 @@ def main():
         # 분개 대차
         dr = cr = None
         for r in range(13, E.max_row+1):
-            if E.cell(r, 2).value == "합계" and isinstance(E.cell(r, 3).value, float):
+            # 정확히 100 이면 openpyxl 이 int 로 돌려준다. float 만 보면 놓친다.
+            if (E.cell(r, 2).value == "합계"
+                    and isinstance(E.cell(r, 3).value, (int, float))):
                 dr, cr = E.cell(r, 3).value, E.cell(r, 4).value
-        chk("분개 차변", dr, 100+ca, 0.01)
-        chk("분개 대변", cr, 100+ca, 0.01)
+        # 분개는 배분표를 뒤집은 것이다. 음수 항목이 차변으로 간다.
+        # 매도청구권을 내재파생에 넣으면 자산 줄이 사라지고, 파생 순액이 자산 쪽이면
+        # 그 줄이 대신 차변으로 간다. 어느 쪽이든 대차는 맞아야 한다.
+        want_dr = 100 + sum(-v for _, v in rows[:-1] if v < 0)
+        chk("분개 차변", dr, want_dr, 0.01)
+        chk("분개 대변", cr, want_dr, 0.01)
         # 상각표 마지막 줄 기말 = 만기상환금액
         M = wb["상각표"]
-        r_eir, rows_eir, redm, nper = G["eir_table"](t, b0)
+        r_eir, rows_eir, redm, nper = G["eir_table"](t, host)
         chk("상각표 기말 = 만기상환금액", M.cell(12+len(rows_eir), 7).value, redm, 0.01)
         chk("상각표 유효이자율", M.cell(9, 3).value, r_eir)
+        chk("상각표 출발 = 배분된 주계약", M.cell(5, 3).value, rows[0][1], 0.01)
 
     print("\n" + ("모든 항목 일치" if not bad else "★ %d건 불일치" % len(bad)))
     for b in bad: print("   ★ " + b)

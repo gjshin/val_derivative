@@ -51,7 +51,8 @@ class Terms:
     k_prem: float = 0.01
     k_w: float = 0.30
     k_lock: float = 25.0
-    k_method: int = 0            # 0 유무가치비교 / 1 혼합할인율 / 2 지분·부채 분리
+    k_method: int = 0
+    k_sep: int = 1                  # 1 별도 금융상품 / 0 복합내재파생에 포함            # 0 유무가치비교 / 1 혼합할인율 / 2 지분·부채 분리
     sig: float = 0.4130
     model: str = "TF"
     conv_class: str = "equity"   # equity 전환권 자본 / liability 전환권 파생상품부채
@@ -476,32 +477,64 @@ def decompose(tm: Terms):
     return full, b0, b1, b2, ca, resid
 
 def allocate(tm: Terms, full, b0, b1, b2, ca):
-    """최초 인식 배분.  전환권 분류에 따라 무엇을 잔여로 두는지가 뒤바뀐다."""
+    """최초 인식 배분.  전환권 분류에 따라 무엇을 잔여로 두는지가 뒤바뀐다.
+
+    매도청구권을 어떻게 볼지는 ``k_sep`` 이 정한다.
+
+    * 1 별도 금융상품 — 제3자 지정이 가능하면 거래상대방이 달라지므로 내재파생이
+      아니라 별도의 금융상품이다 (기준서 1109 문단 4.3.1 마지막 문장).
+      파생상품자산으로 따로 세운다.
+    * 0 복합내재파생에 포함 — 발행회사만 행사할 수 있으면 거래상대방이 그대로라
+      내재파생상품이다. 전환권·조기상환권과 하나의 복합내재파생상품으로 묶는다
+      (문단 B4.3.4). 콜은 발행자에게 유리하므로 묶음을 그만큼 줄인다.
+
+    어느 쪽이든 주계약과 전환권대가는 같다. 파생을 총액으로 볼지 순액으로 볼지가
+    다를 뿐이다.
+    """
+    sep = tm.k_sep != 0
     if tm.conv_class == "liability":
-        # 전환권이 파생상품부채 — 내재파생을 공정가치로 두고 주계약을 잔여로
+        # 전환권이 파생상품부채 — 내재파생을 공정가치로 두고 주계약을 잔여로.
         # 전환권과 조기상환권은 상호의존적이라 하나의 복합내재파생상품으로 묶어
-        # 전체로서(as a whole) 측정한다 (기준서 1109 문단 B4.3.4).
-        # 매도청구권은 제3자 지정이 가능해 별도의 금융상품이므로(1109 문단 4.3.1)
-        # 이 묶음에 넣지 않는다. 발행가액은 전환사채와 콜옵션에 배분하므로
-        # 전환사채에 배분된 금액은 100 + ca 다 (사례 1105 해설2).
-        deriv = b2 - b0
-        host_acc = (100 + ca) - deriv
+        # 전체로서(as a whole) 측정한다 (문단 B4.3.4).
+        deriv = (b2 - b0) if sep else (b2 - ca - b0)
+        host_acc = (100 + ca) - (b2 - b0)      # 어느 쪽이든 같다
         rows = [("주계약 (잔여)", host_acc),
-                ("복합내재파생상품 · 파생상품부채", deriv),
-                ("매도청구권 · 파생상품자산", -ca)]
+                ("복합내재파생상품 · 파생상품부채", deriv)]
+        if sep: rows.append(("매도청구권 · 파생상품자산", -ca))
         note = ("전환권이 파생상품부채이므로 전환권과 조기상환권을 하나의 "
                 "복합내재파생상품으로 묶어 공정가치로 측정하고 주계약을 잔여로 둡니다 "
-                "(기준서 1109 문단 B4.3.4). 전환사채에 배분된 금액은 "
-                f"{100+ca:,.2f} 이고 이론적 주계약가치는 {b0:,.2f} 입니다.")
+                "(기준서 1109 문단 B4.3.4). "
+                + ("매도청구권은 제3자 지정이 가능해 별도의 금융상품이므로 "
+                   "이 묶음에 넣지 않습니다 (문단 4.3.1). 전환사채에 배분된 금액은 "
+                   f"{100+ca:,.2f} 입니다."
+                   if sep else
+                   "매도청구권은 발행회사만 행사할 수 있어 거래상대방이 그대로이므로 "
+                   "내재파생상품이고, 같은 묶음에 넣어 순액으로 측정합니다 (문단 4.3.1).")
+                + f" 이론적 주계약가치는 {b0:,.2f} 입니다.")
     else:
         rows = [("주계약 (옵션 없는 사채)", b0),
-                ("조기상환청구권 · 파생상품부채", b1-b0),
-                ("매도청구권 · 파생상품자산", -ca),
-                ("전환권대가 · 자본", 100-b1+ca)]
+                ("조기상환청구권 · 파생상품부채", (b1-b0) if sep else (b1-b0-ca))]
+        if sep: rows.append(("매도청구권 · 파생상품자산", -ca))
+        if not sep:
+            rows[1] = ("복합내재파생상품 · 파생상품부채", b1-b0-ca)
+        rows.append(("전환권대가 · 자본", 100-b1+ca))
         note = ("기업회계기준서 제1032호 문단 31 — 부채요소를 먼저 정하고 나머지를 자본에 배분합니다. "
-                "최초 인식에는 손익이 생기지 않습니다.")
+                "최초 인식에는 손익이 생기지 않습니다."
+                + ("" if sep else
+                   " 매도청구권은 발행회사만 행사할 수 있어 내재파생상품이므로 "
+                   "조기상환권과 하나로 묶어 순액으로 봅니다 (문단 4.3.1 · B4.3.4)."))
     rows.append(("합계", sum(v for _, v in rows)))
     return rows, note
+
+
+def acc_host(tm: Terms, full, b0, b1, b2, ca):
+    """상각표가 출발해야 하는 금액 — 실제로 인식한 주계약이다.
+
+    자본 분류면 이론적 주계약(b0)이 그대로 인식되지만, 부채 분류면 잔여로
+    떨어진 금액이 인식된다. 상각후원가는 최초 인식액에서 출발해야 하므로
+    이론값이 아니라 배분액으로 유효이자율을 역산한다.
+    """
+    return allocate(tm, full, b0, b1, b2, ca)[0][0][1]
 
 
 def allocate_full(tm: Terms, rows):
@@ -712,6 +745,66 @@ def parse_yields(txt: str, unit: str = "auto"):
     return sorted(out)
 
 
+KIS_TENORS = {"3월": 3, "6월": 6, "9월": 9, "1년": 12, "1년6월": 18, "2년": 24,
+              "2년6월": 30, "3년": 36, "4년": 48, "5년": 60, "7년": 84,
+              "10년": 120, "15년": 180, "20년": 240, "30년": 360, "50년": 600}
+
+
+def read_kisnet(name: str, data: bytes):
+    """KIS-Net 채권시가평가 기준수익률 표를 읽는다.
+
+    첫 시트가 ``종류 · 종류명 · 신용등급 · 고시기관 · 3월 · 6월 · … · 50년`` 이고
+    금리는 % 단위, 값이 없으면 ``-`` 다. 국채 한 줄과 회사채 등급별 여러 줄이
+    한 표에 같이 있으므로, 어느 줄을 무위험으로 쓰고 어느 줄을 위험으로 쓸지는
+    화면에서 고른다.
+
+    돌려주는 것은 ``[(라벨, [(만기(년), 수익률), …]), …]`` 이다.
+    """
+    ext = name.lower().rsplit(".", 1)[-1]
+    if ext == "xls":
+        import xlrd                                  # 옛 형식은 xlrd 만 읽는다
+        sh = xlrd.open_workbook(file_contents=data).sheet_by_index(0)
+        grid = [[sh.cell_value(r, c) for c in range(sh.ncols)]
+                for r in range(sh.nrows)]
+    else:
+        import openpyxl
+        ws = openpyxl.load_workbook(io.BytesIO(data), data_only=True).worksheets[0]
+        grid = [[c if c is not None else "" for c in row]
+                for row in ws.iter_rows(values_only=True)]
+    if not grid: raise ValueError("빈 파일입니다.")
+
+    # 머리 행 — 만기 이름이 가장 많이 걸리는 줄
+    hi, cols = -1, {}
+    for i, row in enumerate(grid[:10]):
+        got = {j: KIS_TENORS[str(v).strip()]
+               for j, v in enumerate(row) if str(v).strip() in KIS_TENORS}
+        if len(got) > len(cols): hi, cols = i, got
+    if len(cols) < 3:
+        raise ValueError("만기 열(3월·6월·1년 …)을 찾지 못했습니다. "
+                         "KIS-Net 기준수익률 표의 첫 시트인지 확인하십시오.")
+
+    out = []
+    for row in grid[hi+1:]:
+        head = [str(row[j]).strip() for j in range(min(3, len(row)))]
+        head = [h for h in head if h and h != "-"]
+        if not head: continue
+        pts = []
+        for j, mth in sorted(cols.items(), key=lambda x: x[1]):
+            if j >= len(row): continue
+            try: y = float(str(row[j]).replace(",", "").replace("%", ""))
+            except ValueError: continue
+            if y > 0: pts.append((mth/12, y/100))
+        if len(pts) >= 2:
+            out.append((" · ".join(head[:3]).replace("*", ""), pts))
+    if not out: raise ValueError("수익률 행을 찾지 못했습니다.")
+    return out
+
+
+def curve_text(pts):
+    """곡선을 화면 입력 형식(개월 · 수익률%)으로 되돌린다."""
+    return "\n".join(f"{round(t*12):d}\t{y*100:.3f}%" for t, y in pts)
+
+
 # ══════════════════════════════════════════════════════════
 # 5. 엑셀 조서
 # ══════════════════════════════════════════════════════════
@@ -855,7 +948,9 @@ def build_xlsx(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         ("매도청구 시작 / 종료 / 주기", tm.k_s, N0), ("　  ", tm.k_e, N0), ("　   ", tm.k_f, N0),
         ("매도청구 프리미엄", tm.k_prem, P2), ("매도청구 한도", tm.k_w, P2),
         ("의무보유 전환지연 (개월)", tm.k_lock, N0),
-        ("매도청구권 평가방법", K_METHODS[tm.k_method], None)]),
+        ("매도청구권 평가방법", K_METHODS[tm.k_method], None),
+        ("매도청구권 회계 처리",
+         "별도 금융상품" if tm.k_sep else "복합내재파생에 포함", None)]),
       ("5. 시장 인풋", [("변동성 σ", tm.sig, P2),
         ("무위험 이표 (연 회)", tm.cmp_rf, N0), ("위험 이표 (연 회)", tm.cmp_cr, N0),
         ("이자율 입력", ("만기수익률 곡선" if tm.y_type == "par"
@@ -1064,7 +1159,8 @@ def build_xlsx(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         M.column_dimensions[cc].width = w
     title(M, 2, "주계약 상각표", span=6)
     sec(M, 4, "유효이자율 역산", span=6)
-    for i, (k, v, fm) in enumerate([("주계약", b0, N2), ("만기상환금액", redm, N2),
+    for i, (k, v, fm) in enumerate([("주계약 (인식액)", rows_eir[0][2] if rows_eir else b0, N2),
+                                    ("만기상환금액", redm, N2),
                                     ("표면이자 (회당)", cpn_amt, N2), ("상각 횟수", nper, N0)]):
         put(M, 5+i, 2, k, border=True); put(M, 5+i, 3, v, fmt=fm, align="right", border=True)
     put(M, 9, 2, "유효이자율 (연, 이산복리)", bold=True, fill=BAND, border=True)
@@ -1230,6 +1326,7 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         ("전환권 분류 (1 자본 / 0 부채)", "eqcls", 1 if tm.conv_class == "equity" else 0, N0, True),
         ("매도청구권 평가방법 (0 유무가치 / 1 혼합할인율 / 2 지분·부채 분리)",
          "kmeth", tm.k_method, N0, True),
+        ("매도청구권 처리 (1 별도 금융상품 / 0 내재파생 포함)", "ksep", tm.k_sep, N0, True),
         ("신용위험 처리 (0 TF / 1 GS)", "mdl", 1 if tm.model == "GS" else 0, N0, True),
         ("전자등록총액 (원)", "face", tm.face_total, N0, True),
         ("무위험 (연속, 평탄)", "rfc", RF(tm.T), P2, False)]
@@ -1688,7 +1785,8 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
              '=IF(ABS(C29-1)<0.0001,"적합","확인 필요")'),
             ("전체 ≥ 주계약", "=C10-C16", '=IF(C30>=0,"적합","확인 필요")'),
             ("배분 합계 = 100",
-             f'=IF({K["eqcls"]}=1,C16+C18-C22+C23,C25+C24-C22)',
+             f'=IF({K["ksep"]}=1,IF({K["eqcls"]}=1,C16+C18-C22+C23,C25+C24-C22),'
+             f'IF({K["eqcls"]}=1,C16+C18-C22+C23,C25+C24-C22))',
              '=IF(ABS(C31-100)<0.01,"적합","확인 필요")'),
             # 상태확장 격자는 재결합하지 않아 엑셀 트리 한 장으로 옮길 수 없다.
             # 앱이 상태확장으로 계산했다면 이 조서는 근사값이므로 그 사실을 밝힌다.
@@ -1752,7 +1850,8 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         "기말 잔액이 만기상환금액과 맞아떨어져야 한다.", color=GREY, size=9)
     sec(M, 5, "유효이자율 역산", span=6)
     for i, (k, fx, fm, val) in enumerate([
-            ("주계약", "=결과!C16", N2, None),
+            # 부채로 분류하면 잔여로 떨어진 금액이 인식액이다. 이론값(C16)이 아니다.
+            ("주계약 (인식액)", f'=IF({K["eqcls"]}=1,결과!C16,결과!C25)', N2, None),
             ("만기상환금액", f"={K['red']}", N2, None),
             ("표면이자 (회당)", f"=100*{K['cpn']}*{K['ipaym']}/12", N2, None),
             ("상각 횟수", None, N0, nper)]):
@@ -1800,10 +1899,15 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     sec(E, 5, "1. 최초 인식 배분", span=5)
     for i, h in enumerate(["항목", "100 기준", "전액 기준 (원)"]):
         put(E, 6, 2+i, h, bold=True, fill=LIGHT, align="center", border=True, size=9)
+    # 매도청구권을 별도 금융상품으로 볼지 내재파생에 넣을지에 따라 표가 갈린다.
+    # 넣는 쪽이면 파생 줄에서 콜을 빼고 자산 줄을 비운다. 합계는 어느 쪽이든 100.
+    KS = K["ksep"]
     al2 = [("주계약", f'=IF({K["eqcls"]}=1,결과!C16,결과!C25)'),
-           ("조기상환청구권 · 파생상품부채", f'=IF({K["eqcls"]}=1,결과!C18,"")'),
-           ("복합내재파생상품 · 파생상품부채", f'=IF({K["eqcls"]}=0,결과!C24,"")'),
-           ("매도청구권 · 파생상품자산", "=-결과!C22"),
+           ("조기상환청구권 · 파생상품부채",
+            f'=IF({K["eqcls"]}=0,"",IF({KS}=1,결과!C18,결과!C18-결과!C22))'),
+           ("복합내재파생상품 · 파생상품부채",
+            f'=IF({K["eqcls"]}=1,"",IF({KS}=1,결과!C24,결과!C24-결과!C22))'),
+           ("매도청구권 · 파생상품자산", f'=IF({KS}=1,-결과!C22,"")'),
            ("전환권대가 · 자본", f'=IF({K["eqcls"]}=1,결과!C23,"")')]
     for i, (nm, fx) in enumerate(al2):
         r = 7+i
@@ -1817,10 +1921,13 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     sec(E, 14, "2. 분개", span=5)
     for i, h in enumerate(["계정", "차변 (100)", "대변 (100)", "차변 (원)", "대변 (원)"]):
         put(E, 15, 2+i, h, bold=True, fill=LIGHT, align="center", border=True, size=9)
-    je2 = [("현금", "=100", None), ("파생상품자산 (매도청구권)", "=결과!C22", None),
+    je2 = [("현금", "=100", None),
+           ("파생상품자산 (매도청구권)", f'=IF({KS}=1,결과!C22,"")', None),
            ("　전환사채 (주계약)", None, f'=IF({K["eqcls"]}=1,결과!C16,결과!C25)'),
-           ("　파생상품부채 (조기상환청구권)", None, f'=IF({K["eqcls"]}=1,결과!C18,"")'),
-           ("　파생상품부채 (복합내재파생상품)", None, f'=IF({K["eqcls"]}=0,결과!C24,"")'),
+           ("　파생상품부채 (조기상환청구권)", None,
+            f'=IF({K["eqcls"]}=0,"",IF({KS}=1,결과!C18,결과!C18-결과!C22))'),
+           ("　파생상품부채 (복합내재파생상품)", None,
+            f'=IF({K["eqcls"]}=1,"",IF({KS}=1,결과!C24,결과!C24-결과!C22))'),
            ("　전환권대가 (자본)", None, f'=IF({K["eqcls"]}=1,결과!C23,"")')]
     for i, (nm, dr, cr) in enumerate(je2):
         r = 16+i
@@ -1998,6 +2105,15 @@ with st.sidebar:
         t.k_prem = st.number_input("프리미엄 (연 %)", value=t.k_prem*100, step=0.5)/100
         t.k_w = st.number_input("행사 한도 (%)", value=t.k_w*100, step=5.0)/100
         t.k_lock = st.number_input("의무보유 전환지연 (개월)", value=float(t.k_lock), step=1.0)
+        t.k_sep = 1 if st.selectbox(
+            "회계 처리", ["별도 금융상품", "복합내재파생에 포함"],
+            index=0 if t.k_sep else 1,
+            help="발행회사가 지정하는 제3자가 살 수 있으면 거래상대방이 달라지므로 "
+                 "별도의 금융상품입니다 (기준서 1109 문단 4.3.1). 발행회사만 "
+                 "행사할 수 있으면 내재파생상품이라 전환권·조기상환권과 하나로 "
+                 "묶습니다 (문단 B4.3.4). 주계약과 전환권대가는 어느 쪽이든 같고 "
+                 "파생을 총액으로 볼지 순액으로 볼지가 다릅니다."
+            ) == "별도 금융상품" else 0
         t.k_method = st.selectbox("평가방법", [0, 1, 2],
                                   index=[0, 1, 2].index(t.k_method),
                                   format_func=lambda i: K_METHODS[i])
@@ -2079,17 +2195,65 @@ with st.sidebar:
                                         step=1, min_value=1, max_value=12))
         st.caption("국고채는 6개월 이표(2회), 회사채는 3개월 이표(4회)가 발행 관행입니다. "
                    "부트스트래핑에서 현금흐름 시점을 잡는 데 쓰입니다.")
-        rf_txt = st.text_area("무위험 곡선 (국공채 YTM)",
-            "2025-08-29\t3\t2.40%\n2025-11-29\t6\t2.38%\n2026-05-29\t12\t2.25%\n"
-            "2027-05-29\t24\t2.33%\n2028-05-29\t36\t2.34%\n2030-05-29\t60\t2.50%", height=130)
+        # ── KIS-Net 기준수익률 표에서 바로 채우기 ──
+        kf = st.file_uploader("KIS-Net 기준수익률 표 (선택)", type=["xls", "xlsx"],
+                              key="kisnet",
+                              help="채권시가평가 기준수익률 표를 그대로 올리면 "
+                                   "무위험·위험 곡선을 골라 아래 칸에 채웁니다.")
+        if kf is not None:
+            try:
+                _rows = read_kisnet(kf.name, kf.getvalue())
+            except Exception as ex:
+                st.error(f"읽지 못했습니다 — {ex}")
+            else:
+                _lbl = [x[0] for x in _rows]
+
+                def _first(*cands):
+                    """앞에서부터 걸리는 첫 줄. 0 번이 정답일 수 있어 None 으로 가른다."""
+                    for ws in cands:
+                        for i, L in enumerate(_lbl):
+                            if all(w in L for w in ws): return i
+                    return 0
+
+                st.success(f"{len(_rows)}개 곡선을 찾았습니다.")
+                k1, k2 = st.columns(2)
+                _ri = k1.selectbox(
+                    "무위험으로 쓸 줄", range(len(_rows)),
+                    index=_first(("국채", "국고채권"), ("국채",)),
+                    format_func=lambda i: _lbl[i])
+                _ci = k2.selectbox(
+                    "위험으로 쓸 줄", range(len(_rows)),
+                    index=_first(("회사채 II", "무보증"), ("회사채", "무보증"), ("회사채",)),
+                    format_func=lambda i: _lbl[i])
+                st.caption("사모 CB 는 **회사채 II(사모사채)** 줄이 성격에 가깝습니다. "
+                           "무등급이면 추정 등급을 고르고 근거를 조서에 남기십시오.")
+                if st.button("이 곡선 적용", use_container_width=True, type="primary"):
+                    st.session_state.rf_txt = curve_text(_rows[_ri][1])
+                    st.session_state.cr_txt = curve_text(_rows[_ci][1])
+                    st.session_state.kis_src = (_lbl[_ri], _lbl[_ci])
+                    st.rerun()
+        if st.session_state.get("kis_src"):
+            st.caption("적용된 곡선 — 무위험 **%s** · 위험 **%s**"
+                       % st.session_state["kis_src"])
+
+        # 두 곡선 모두 같은 형식이다 — 만기(개월) 다음에 수익률(%).
+        # 날짜 열이 앞에 붙어 있어도 그대로 읽는다.
+        st.caption("형식은 두 곡선이 같습니다 — 한 줄에 **만기 · 수익률**. "
+                   "고시표를 날짜 열까지 통째로 붙여 넣어도 날짜는 알아서 버립니다.")
+        if "rf_txt" not in st.session_state:
+            st.session_state.rf_txt = ("3\t2.40%\n6\t2.38%\n12\t2.25%\n"
+                                       "24\t2.33%\n36\t2.34%\n60\t2.50%")
+        if "cr_txt" not in st.session_state:
+            st.session_state.cr_txt = ("12\t5.10%\n24\t5.70%\n36\t6.20%\n"
+                                       "48\t6.65%\n60\t7.05%")
+        rf_txt = st.text_area("무위험 곡선 (국공채 YTM)", key="rf_txt", height=130)
         t.rf_curve = parse_yields(rf_txt, unit)
         t.rate_mode = st.selectbox("위험 곡선", ["direct", "rating"],
                                    index=0 if t.rate_mode == "direct" else 1,
                                    format_func=lambda x: "YTM 직접 입력" if x == "direct"
                                    else "두 등급 곡선으로 보간")
         if t.rate_mode == "direct":
-            cr_txt = st.text_area("위험 곡선 (등급별 회사채 YTM)",
-                "12 5.10\n24 5.70\n36 6.20\n48 6.65\n60 7.05", height=110)
+            cr_txt = st.text_area("위험 곡선 (등급별 회사채 YTM)", key="cr_txt", height=130)
             t.cr_curve = parse_yields(cr_txt, unit)
             t.cr_curve_b = []
         else:
@@ -2100,8 +2264,12 @@ with st.sidebar:
                                   index=RATINGS.index(t.rt_b) if t.rt_b in RATINGS else 9)
             t.rt_tgt = r3.selectbox("평가대상", RATINGS,
                                     index=RATINGS.index(t.rt_tgt) if t.rt_tgt in RATINGS else 8)
-            ca_txt = st.text_area(f"{t.rt_a} 곡선", "12 4.60\n36 5.40\n60 6.10", height=80)
-            cb_txt = st.text_area(f"{t.rt_b} 곡선", "12 5.80\n36 7.20\n60 8.30", height=80)
+            if "ca_txt" not in st.session_state:
+                st.session_state.ca_txt = "12\t4.60%\n36\t5.40%\n60\t6.10%"
+            if "cb_txt" not in st.session_state:
+                st.session_state.cb_txt = "12\t5.80%\n36\t7.20%\n60\t8.30%"
+            ca_txt = st.text_area(f"{t.rt_a} 곡선", key="ca_txt", height=100)
+            cb_txt = st.text_area(f"{t.rt_b} 곡선", key="cb_txt", height=100)
             t.cr_curve = parse_yields(ca_txt, unit)
             t.cr_curve_b = parse_yields(cb_txt, unit)
             ia, ib, it2 = rating_idx(t.rt_a), rating_idx(t.rt_b), rating_idx(t.rt_tgt)
@@ -2312,7 +2480,7 @@ with tabs[4]:
                "장기 할인율의 영향이 줄어듭니다.")
 
 with tabs[5]:
-    r_eir, rows_eir, red, nper = eir_table(t, b0)
+    r_eir, rows_eir, red, nper = eir_table(t, acc_host(t, full, b0, b1, b2, ca))
     st.dataframe(pd.DataFrame([
         ["주계약 (옵션 없는 사채)", f"{b0:,.2f}"], ["만기상환금액", f"{red:,.2f}"],
         ["표면이자 (회당)", f"{100*t.cpn*t.ipay/12:,.2f}"], ["상각 횟수", f"{nper}회"],
@@ -2370,7 +2538,7 @@ with tabs[7]:
     _pv = (100*(1 + accrue_rate(t.p_s/12, t.p_yield, t.cpn, t.p_cmp))
            if t.p_mode == "accrue" else t.p_rate)
     _pt = max(0.0, (t.p_s - t.elapsed_m)/12)       # 평가기준일 기준 첫 조기상환일
-    _rw = eir_table(t, b0)[1]
+    _rw = eir_table(t, acc_host(t, full, b0, b1, b2, ca))[1]
     _bv = next((en for _, tt_, _b, _i, _c, en in _rw if tt_ >= _pt - 1e-9), b0)
     _gap = abs(_pv - _bv)/max(_bv, 1e-9)
     st.dataframe(pd.DataFrame([
@@ -2434,13 +2602,15 @@ with tabs[8]:
         try:
             with st.spinner("엑셀 작성 중"):
                 if kind == "값":
-                    data = build_xlsx(t, full, b0, b1, b2, ca, conv, eir_table(t, b0))
+                    data = build_xlsx(t, full, b0, b1, b2, ca, conv,
+                                      eir_table(t, acc_host(t, full, b0, b1, b2, ca)))
                     fn = f"CB평가조서_값_{dt.date.today()}.xlsx"
                 else:
                     tf = Terms(**asdict(t))
                     if tf.carry == 0 and tf.rfx_mode > 0: tf.carry = 1
                     ff, f0, f1, f2, fca, fconv = decompose(tf)
-                    data = build_xlsx_formula(tf, ff, f0, f1, f2, fca, fconv, eir_table(tf, f0))
+                    data = build_xlsx_formula(tf, ff, f0, f1, f2, fca, fconv,
+                                              eir_table(tf, acc_host(tf, ff, f0, f1, f2, fca)))
                     fn = f"CB평가조서_수식_{dt.date.today()}.xlsx"
             st.session_state.report = (fn, data)
         except ModuleNotFoundError:
