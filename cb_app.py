@@ -9,7 +9,7 @@
 금액은 전자등록금액 100 기준이다.
 """
 from __future__ import annotations
-import math, json, io, calendar, datetime as dt
+import math, json, io, re, calendar, datetime as dt
 from dataclasses import dataclass, asdict, field
 
 import numpy as np
@@ -1151,6 +1151,135 @@ def curve_text(pts):
 
 
 # ══════════════════════════════════════════════════════════
+# 4-2. 금리변동성 — BDT 의 σ 를 시계열에서 뽑는다
+# ══════════════════════════════════════════════════════════
+# 할인율은 이미 등급보간(blend_curves) → 만기보간(_lin) 두 번을 거친다.
+# 변동성도 같은 자료·같은 보간에서 나와야 조서가 하나로 이어진다.
+#
+# 순서가 중요하다. **보간을 먼저 하고 변동성을 나중에** 구한다. 변동성은
+# 선형 함수가 아니라 등급별 σ 를 보간하면 값이 달라진다 — 내삽이면 2% 안쪽이지만
+# 외삽하면 9% 가까이 벌어진다.
+
+TENOR_MO = dict(KIS_TENORS)
+TENOR_MO.update({"1개월": 1, "3개월": 3, "6개월": 6, "9개월": 9,
+                 "1년6개월": 18, "2년6개월": 30, "18월": 18, "30월": 30})
+
+
+def _tenor_years(label) -> float:
+    """만기 머리글을 연 단위로. '3년' · '1년6개월' · '0.25' · '36'(개월) 을 받는다."""
+    s = str(label).strip()
+    if not s: return None
+    if s in TENOR_MO: return TENOR_MO[s]/12
+    m = re.match(r"^\s*(\d+)\s*년\s*(?:(\d+)\s*개?월)?\s*$", s)
+    if m: return int(m.group(1)) + (int(m.group(2) or 0))/12
+    m = re.match(r"^\s*(\d+)\s*개?월\s*$", s)
+    if m: return int(m.group(1))/12
+    try:
+        v = float(s.replace(",", ""))
+    except Exception:
+        return None
+    # 12 보다 크면 개월로 본다. 만기 곡선에 12년 이상은 드물다.
+    return v/12 if v > 12 else (v if v > 0 else None)
+
+
+def parse_rate_matrix(txt: str):
+    """일자 × 만기 표를 읽는다. 첫 열이 일자, 머리글이 만기다.
+
+    금투협·KIS-Net 에서 등급 하나의 시계열을 내려받으면 이 꼴이다.
+    반환은 ([만기(년)], [(일자, [수익률…])]) 이고 수익률은 % 단위 그대로다.
+    """
+    lines = [l for l in (x.rstrip() for x in txt.splitlines()) if l.strip()]
+    if not lines: return [], []
+
+    def cut(l):
+        l = re.sub(r'"([^"]*)"', lambda m: m.group(1).replace(",", ""), l)
+        return [x.strip() for x in re.split(r"[\t,;]|\s{2,}", l)]
+
+    isdate = lambda x: bool(re.match(r"^\d{4}[-./]\d{1,2}[-./]\d{1,2}$", x.strip()))
+    hdr, body = None, []
+    for l in lines:
+        c = cut(l)
+        if c and isdate(c[0]):
+            body.append(c)
+        elif hdr is None and len(c) >= 2:
+            hdr = c                                  # 첫 비날짜 줄을 머리글로
+    if hdr is None or len(body) < 10: return [], []
+    ten = [(j, _tenor_years(hdr[j])) for j in range(1, len(hdr))]
+    ten = [(j, y) for j, y in ten if y]
+    if not ten: return [], []
+    rows = []
+    for c in body:
+        vals = []
+        for j, _ in ten:
+            try:
+                vals.append(float(c[j].replace(",", "").replace("%", "")))
+            except Exception:
+                vals.append(None)
+        if any(v is not None and v > 0 for v in vals):
+            d = c[0].replace(".", "-").replace("/", "-").split("-")
+            rows.append((f"{d[0]}-{int(d[1]):02d}-{int(d[2]):02d}", vals))
+    if len(rows) >= 2 and rows[0][0] > rows[-1][0]: rows.reverse()
+    return [y for _, y in ten], rows
+
+
+def cm_series(tenors, rows, T: float):
+    """고정만기 시계열 — 매일 그날 곡선에서 잔존만기 T 지점을 뽑는다.
+
+    과거로 갈 때 만기를 함께 늘리면 금리 변동이 아니라 만기 이동 효과가
+    변동성에 섞인다. 국고채 지표금리를 만기 고정으로 고시하는 것과 같은 이유다.
+    """
+    out = []
+    for d, vals in rows:
+        pts = [(t, v) for t, v in zip(tenors, vals) if v is not None and v > 0]
+        if len(pts) < 2: continue
+        pts.sort()
+        y = _lin(pts, T)
+        if y and y > 0: out.append((d, y))
+    return out
+
+
+def blend_series(sa, sb, ra: str, rb: str, rt: str):
+    """두 등급의 고정만기 시계열을 노치 거리로 섞는다.
+
+    blend_curves 와 같은 가중치를 쓴다. 날짜가 둘 다 있는 날만 남긴다.
+    """
+    ia, ib, it = rating_idx(ra), rating_idx(rb), rating_idx(rt)
+    if not sb: return list(sa)
+    if not sa: return list(sb)
+    if ia < 0 or ib < 0 or it < 0 or ia == ib: return list(sa)
+    w = (it-ia)/(ib-ia)
+    db = dict(sb)
+    return [(d, y + (db[d]-y)*w) for d, y in sa if d in db]
+
+
+def rate_vol(series, tdays=250, drop=True):
+    """금리 시계열의 변동성. 상대(로그정규)와 절대(정규)를 함께 준다.
+
+    BDT 의 σ 는 **상대** 변동성이다. 실무에서 bp 로 말하는 절대 변동성을
+    그대로 넣으면 크게 어긋나므로 둘을 나란히 보여 준다.
+
+        상대 ≈ 절대 ÷ 평균금리
+    """
+    v = vol_from(series, tdays, drop)
+    if not v: return None
+    lv = np.array([y for _, y in series], dtype=float)
+    lg = np.diff(np.log(lv))
+    dif = np.diff(lv)
+    # 상대 변동성이 채택분으로만 계산되므로 절대 변동성도 같은 날만 쓴다.
+    # 전체로 계산하면 이상치를 뺀 상대값과 견줄 수 없고, 리포트 수식과도 어긋난다.
+    if drop and v.get("lo") is not None:
+        keep = (lg >= v["lo"]) & (lg <= v["hi"])
+        dif = dif[keep]
+    v = dict(v)
+    v["abs_daily"] = float(np.std(dif, ddof=1)) if len(dif) > 1 else 0.0
+    v["abs_annual"] = v["abs_daily"]*math.sqrt(tdays)
+    v["mean"] = float(np.mean(lv))
+    v["min"] = float(np.min(lv))
+    v["neg"] = int((lv <= 0).sum())
+    return v
+
+
+# ══════════════════════════════════════════════════════════
 # 4-1. 리포트 공통 서식
 # ══════════════════════════════════════════════════════════
 # 조서와 같은 손맛으로 보이도록 색·글꼴·번호서식을 한곳에 모았다.
@@ -1262,7 +1391,7 @@ def lerp_formula(t, pts, col, row0, sh=None):
 
 
 def build_xlsx_vol(series, tdays=250, drop=True, mad_k=2.5, pick="median",
-                   applied=None, asof=None):
+                   applied=None, asof=None, kind="stock", how=None):
     """변동성 산출내역 리포트. 계산이 전부 수식으로 들어간다.
 
     series 는 [(이름, [(일자, 종가), …]), …] 다. 하나면 대상회사만,
@@ -1278,6 +1407,11 @@ def build_xlsx_vol(series, tdays=250, drop=True, mad_k=2.5, pick="median",
     if not series: raise ValueError("종가가 10개 이상인 계열이 하나도 없습니다.")
     many = len(series) > 1
     YEL = "FFF9DB"
+    # 금리 계열이면 절대(정규) 변동성을 한 줄 더 낸다. 실무에서 bp 로 말하는
+    # 그 값이고, BDT 가 쓰는 상대(로그정규) 변동성과 헷갈리기 쉬워 나란히 둔다.
+    _rate = (kind == "rate")
+    UNIT = "금리 (%)" if _rate else "종가"
+    RET = "로그변화율" if _rate else "로그수익률"
     PICKS = {"median": "중앙값", "mean": "단순평균", "max": "최댓값", "min": "최솟값"}
 
     # 회사별 시트의 행 자리. 한곳에서 정해 두고 수식이 이 이름만 쓴다.
@@ -1285,7 +1419,9 @@ def build_xlsx_vol(series, tdays=250, drop=True, mad_k=2.5, pick="median",
     R_NP, R_NR, R_MD = 8, 9, 10         # 종가 수 · 수익률 수 · 중앙값
     R_MA, R_LO, R_HI = 11, 12, 13       # MAD · 하한 · 상한
     R_EX, R_SD, R_AN = 14, 15, 16       # 제외 · 일 변동성 · 연 변동성
-    HDR, R0 = 19, 20                    # 표 머리 · 첫 자료행
+    R_AD, R_AA, R_MN = 17, 18, 19       # 절대 일·연 변동성 · 평균 (금리만)
+    HDR = 22 if _rate else 19           # 표 머리
+    R0 = HDR + 1                        # 첫 자료행
 
     names = [f"{i:02d} {_vsafe(nm)}"[:31] for i, (nm, _) in enumerate(series, 1)]
 
@@ -1298,14 +1434,18 @@ def build_xlsx_vol(series, tdays=250, drop=True, mad_k=2.5, pick="median",
     r = 5
     sec(C, r, "산출 요약"); r += 1
     cols(C, r, ["항목", "내용"], [26, 62]); r += 1
-    for k, v in [("평가기준일", (asof or dt.date.today()).isoformat()),
+    for k, v in ([("평가기준일", (asof or dt.date.today()).isoformat()),
                  ("대상 계열", f"{len(series)}개 — " + " · ".join(nm for nm, _ in series)),
-                 ("수익률", "일별 로그수익률  ln(종가 ÷ 직전 종가)"),
+                 ("수익률", f"일별 {RET}  ln({UNIT} ÷ 직전 {UNIT})"),
                  ("이상치 처리", (f"중앙값 절대편차(MAD) × {mad_k:g} 밖을 제외"
                                 if drop else "제외하지 않음")),
                  ("표준편차", "표본표준편차 STDEV.S — 자유도 n−1"),
                  ("연환산", f"일 변동성 × √{tdays:g}"),
-                 ("종합 방법", PICKS.get(pick, pick) if many else "대상회사 단일")]:
+                  ("종합 방법", PICKS.get(pick, pick) if many else "단일 계열")]
+                 + ([("산출 경위", how)] if how else [])
+                 + ([("변동성 종류", "상대(로그정규) — BDT 의 σ 다. 절대(정규) "
+                                  "변동성도 함께 내되 모형에는 상대를 쓴다")]
+                    if _rate else [])):
         put(C, r, 2, k, bold=True, border=True, fill=RPT["light"])
         put(C, r, 3, v, border=True, wrap=True)
         C.merge_cells(start_row=r, start_column=3, end_row=r, end_column=8)
@@ -1350,17 +1490,30 @@ def build_xlsx_vol(series, tdays=250, drop=True, mad_k=2.5, pick="median",
                 f"=COUNT({D1}:{DN})-COUNT($G${R0+1}:$G${last})", R_N0, False),
                (R_SD, "일 변동성", f"=STDEV.S($G${R0+1}:$G${last})", R_P4, False),
                (R_AN, "연 변동성", f"=$C${R_SD}*SQRT($C${R_TD})", R_P2, False)]
+        if _rate:
+            lab += [(R_AD, "절대 일 변동성 (%p)",
+                     f"=STDEV.S($H${R0+1}:$H${last})", R_N4, False),
+                    (R_AA, "절대 연 변동성 (%p)",
+                     f"=$C${R_AD}*SQRT($C${R_TD})", R_N4, False),
+                    (R_MN, "평균 금리 (%)",
+                     f"=AVERAGE($C${R0}:$C${last})", R_N4, False)]
         for rr, k, v, fm, inp in lab:
             fin = (rr == R_AN)
             put(W, rr, 2, k, bold=True, border=True,
                 fill=(YEL if inp else (RPT["warm"] if fin else RPT["light"])))
             put(W, rr, 3, v, fmt=fm, border=True, align="right", bold=fin,
                 fill=(YEL if inp else (RPT["warm"] if fin else None)))
-        note(W, R_AN+1, "MAD 는 중앙값 절대편차에 1.4826 을 곱해 정규분포의 표준편차와 "
-                        "눈금을 맞춘 값이다. 중앙값과 MAD 는 제외 전 전체 수익률로 구하고, "
-                        "표준편차만 채택분으로 구한다.", span=6)
-        cols(W, HDR, ["일자", "종가", "로그수익률", "|편차|", "채택", "채택 수익률"],
-             [15, 13, 14, 13, 9, 14])
+        note(W, (R_MN if _rate else R_AN)+1,
+             "MAD 는 중앙값 절대편차에 1.4826 을 곱해 정규분포의 표준편차와 눈금을 "
+             "맞춘 값이다. 중앙값과 MAD 는 제외 전 전체 " + RET + " 로 구하고, "
+             "표준편차만 채택분으로 구한다."
+             + ("  절대 변동성은 로그가 아니라 금리 차이(%p)의 표준편차다. "
+                "상대 ≈ 절대 ÷ 평균금리 로 환산된다 — BDT 에는 **상대**를 넣는다."
+                if _rate else ""), span=(7 if _rate else 6))
+        _hd = ["일자", UNIT, RET, "|편차|", "채택", f"채택 {RET}"]
+        _wd = [15, 13, 14, 13, 9, 14]
+        if _rate: _hd, _wd = _hd + ["채택 변화분"], _wd + [13]
+        cols(W, HDR, _hd, _wd)
         for i, (d, v) in enumerate(px):
             rr = R0 + i
             put(W, rr, 2, (dt.date.fromisoformat(d) if d else None),
@@ -1373,6 +1526,10 @@ def build_xlsx_vol(series, tdays=250, drop=True, mad_k=2.5, pick="median",
                           f"IF(AND(D{rr}>=$C${R_LO},D{rr}<=$C${R_HI}),1,0))",
                 fmt=R_N0, border=True, align="center")
             put(W, rr, 7, f'=IF(F{rr}=1,D{rr},"")', fmt=R_N6, border=True, align="right")
+            if _rate:
+                # 절대 변동성용 — 로그가 아니라 금리 차이(%p) 다
+                put(W, rr, 8, f'=IF(F{rr}=1,C{rr}-C{rr-1},"")', fmt=R_N4,
+                    border=True, align="right")
 
     # ── 종합 ──
     if many:
@@ -3110,6 +3267,7 @@ st.caption("계약조건과 시장자료를 넣으면 이항격자로 옵션을 
 if "tm" not in st.session_state: st.session_state.tm = Terms()
 if "prices" not in st.session_state: st.session_state.prices = []
 if "peers" not in st.session_state: st.session_state.peers = []
+if "rate_series" not in st.session_state: st.session_state.rate_series = []
 
 with st.sidebar:
     st.subheader("계약조건")
@@ -3227,6 +3385,91 @@ with st.sidebar:
                            "조서에 적으십시오.")
             st.caption("로그정규 변동성입니다. 실무에서는 10~30% 를 씁니다. "
                        "0 이면 지금과 같은 값이 나옵니다.")
+
+            st.markdown("**시계열로 σ 산출**")
+            st.caption("할인율은 이미 등급보간 → 만기보간을 거칩니다. 변동성도 같은 "
+                       "자료·같은 보간에서 나와야 조서가 하나로 이어집니다.")
+            _rmode = st.radio("자료", ["single", "blend"], horizontal=True,
+                              key="rvmode",
+                              format_func=lambda x: "단일 시계열" if x == "single"
+                              else "등급·만기 보간")
+            _rt = int(st.number_input("연 거래일수", value=250, step=5,
+                                      min_value=30, key="rvtd"))
+            _rdrop = st.checkbox("이상치 제거 (MAD 2.5배)", value=True, key="rvdrop")
+            _ser, _how = None, ""
+            if _rmode == "single":
+                _f1 = st.file_uploader("금리 시계열 (일자 · 금리)",
+                                       type=["xlsx", "xlsm", "csv", "txt", "tsv"],
+                                       key="rv1")
+                if _f1 is not None:
+                    try:
+                        _ser = parse_prices(read_upload(_f1.name, _f1.getvalue()))
+                        _how = f"{_f1.name} · 단일 시계열"
+                    except Exception as ex:
+                        st.error(str(ex))
+            else:
+                st.caption(f"이자율 칸의 등급 설정을 그대로 씁니다 — "
+                           f"**{t.rt_a} · {t.rt_b} → {t.rt_tgt}**, "
+                           f"잔존만기 **{t.T:.2f}년**. 두 파일 모두 "
+                           "첫 열이 일자, 머리글이 만기여야 합니다.")
+                _fa = st.file_uploader(f"{t.rt_a} 시계열", key="rva",
+                                       type=["xlsx", "xlsm", "csv", "txt", "tsv"])
+                _fb = st.file_uploader(f"{t.rt_b} 시계열", key="rvb",
+                                       type=["xlsx", "xlsm", "csv", "txt", "tsv"])
+                if _fa is not None:
+                    try:
+                        _ta, _ra = parse_rate_matrix(read_upload(_fa.name, _fa.getvalue()))
+                        _sa = cm_series(_ta, _ra, t.T)
+                        _sb = []
+                        if _fb is not None:
+                            _tb, _rb = parse_rate_matrix(read_upload(_fb.name, _fb.getvalue()))
+                            _sb = cm_series(_tb, _rb, t.T)
+                        if not _sa:
+                            st.error("만기 머리글을 찾지 못했습니다. 첫 줄에 "
+                                     "`3월 · 1년 · 3년` 같은 만기가 있어야 합니다.")
+                        else:
+                            _ser = blend_series(_sa, _sb, t.rt_a, t.rt_b, t.rt_tgt)
+                            _w = ((rating_idx(t.rt_tgt)-rating_idx(t.rt_a))
+                                  / max(rating_idx(t.rt_b)-rating_idx(t.rt_a), 1)
+                                  if _sb else 0.0)
+                            _how = (f"{t.rt_a}·{t.rt_b} → {t.rt_tgt} (가중치 {_w:.2f}) · "
+                                    f"고정만기 {t.T:.2f}년")
+                            if _sb and not (0 <= _w <= 1):
+                                st.warning(f"평가대상 등급이 두 곡선 **밖**입니다 "
+                                           f"(가중치 {_w:.2f}). 외삽하면 변동성이 "
+                                           "실제와 크게 벌어질 수 있습니다 — 바깥쪽 "
+                                           "등급을 두 번째 곡선으로 쓰는 편이 낫습니다.")
+                            if not _sb:
+                                st.info("두 번째 파일이 없어 첫 곡선을 그대로 씁니다.")
+                    except Exception as ex:
+                        st.error(str(ex))
+            if _ser and len(_ser) >= 10:
+                _v = rate_vol(_ser, _rt, _rdrop)
+                if _v:
+                    st.session_state.rate_series = _ser
+                    st.session_state.rate_how = _how
+                    st.session_state.rate_opt = dict(tdays=_rt, drop=_rdrop)
+                    st.metric("상대 변동성 (BDT 의 σ)", f"{_v['annual']*100:.2f}%",
+                              f"절대 {_v['abs_annual']:.3f}%p")
+                    st.caption(f"평균 금리 {_v['mean']:.3f}% · 관측 {_v['n']}개 · "
+                               f"{_ser[0][0]} ~ {_ser[-1][0]}"
+                               + (f" · 이상치 {_v['removed']}개 제거" if _v['removed'] else "")
+                               + f"  ·  절대 ÷ 평균 = {_v['abs_annual']/max(_v['mean'],1e-9)*100:.2f}%")
+                    if _v["neg"]:
+                        st.error(f"0 이하인 금리가 {_v['neg']}개 있습니다. 로그를 쓸 수 "
+                                 "없어 그 구간이 빠집니다.")
+                    if _v["min"] < 1.0:
+                        st.warning(f"최저 금리가 {_v['min']:.3f}% 입니다. 저금리 구간에서는 "
+                                   "작은 변동도 로그로는 크게 잡혀 σ 가 부풀어 오릅니다.")
+                    _exp = 0 if t.bdt_base else 1
+                    st.caption("기준 곡선이 **"
+                               + ("무위험 + 확정 스프레드" if t.bdt_base else "위험 곡선 직접")
+                               + "** 이므로 "
+                               + ("국고채" if t.bdt_base else "회사채(평가대상 등급)")
+                               + " 시계열을 쓰셔야 맞습니다.")
+                    if st.button("이 변동성 적용", use_container_width=True,
+                                 type="primary", key="rvapply"):
+                        t.bdt_sig = _v["annual"]
 
     with st.expander("매도청구권"):
         t.k_s = st.number_input("시작 (개월)", value=float(t.k_s), step=1.0, key="ks")
