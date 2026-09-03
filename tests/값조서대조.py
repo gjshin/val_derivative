@@ -25,11 +25,15 @@ def load_app():
     return m.__dict__
 
 
-CASES = [(cls, km, md, ks)
+# 마지막 칸은 BDT 변동성이다. None 이면 조기상환권을 금리 고정 격자로 잰다.
+CASES = [(cls, km, md, ks, None)
          for cls in ("equity", "liability")
          for km in (0, 1, 2)
          for md in ("TF", "GS")
          for ks in (1, 0)]
+# 조기상환권을 BDT 로 잴 때. 자본·TF 에서만 열리므로 그 조합만 더한다.
+# σ=0 은 확정 격자와 같은 값이 나와야 하고, σ>0 은 BDT 시트가 결과와 맞아야 한다.
+CASES += [("equity", km, "TF", 1, sg) for km in (0, 1) for sg in (0.0, 0.20)]
 
 
 def main():
@@ -44,11 +48,13 @@ def main():
                  "OK" if ok else "★"))
         if not ok: bad.append(tag)
 
-    for cls, km, md, ks in CASES:
+    for cls, km, md, ks, bsg in CASES:
         t = G["Terms"]()
         t.rf_curve = [(1, .0226), (3, .0240), (5, .0252)]
         t.cr_curve = [(1, .1409), (3, .1740), (5, .1905)]
         t.conv_class, t.k_method, t.model, t.k_sep = cls, km, md, ks
+        t.put_bdt = 1 if bsg is not None else 0
+        if bsg is not None: t.bdt_sig = bsg
         t.face_total = 9_000_000_000
         G["derive"](t)
         full, b0, b1, b2, ca, conv = G["decompose"](t)
@@ -59,7 +65,17 @@ def main():
             G["build_xlsx"](t, full, b0, b1, b2, ca, conv, G["eir_table"](t, host))),
             data_only=True)
         E, R = wb["회계처리"], wb["결과"]
-        print(f"\n[{cls} · 방법{km} · {md} · {'별도' if ks else '내재파생'}]")
+        print(f"\n[{cls} · 방법{km} · {md} · {'별도' if ks else '내재파생'}"
+              + (f" · BDT σ{bsg:.0%}" if bsg is not None else "") + "]")
+        # BDT 를 켰으면 그 시트가 결과와 맞아야 한다. 옵션 없는 사채는 ⑩ 주계약과
+        # 같아야 하고 — 곡선을 정확히 되돌린다는 뜻이다.
+        if bsg is not None:
+            nn = int(t.n)
+            chk("BDT 부채요소 = B1", wb["BDT 부채요소"].cell(13+nn+2, 3).value, b1, 1e-5)
+            chk("BDT 주계약 = B0", wb["BDT 주계약"].cell(13+nn+2, 3).value, b0, 1e-5)
+            if bsg == 0:
+                g = G["pick"](G["engine"](t, conv=False, put=True, call=False), t.model)
+                chk("σ=0 이면 확정 격자와 같다", b1, g, 1e-9)
         # 결과 시트 · 순차 차감
         for i, (nm, v) in enumerate([("B0 주계약", b0), ("B1 부채요소", b1),
                                      ("B2 전체", b2), ("B3 매도청구 반영", b2-ca)]):
