@@ -4,5 +4,7 @@ pandas>=2.2
 matplotlib>=3.8
 openpyxl>=3.1
 # pykrx 는 스트림릿 클라우드에서 설치가 자주 실패해 뺐다
-yfinance>=0.2.40
+# yfinance 0.2.58 부터 curl_cffi 를 요구한다. 그 휠은 파이썬 3.10 이상에만
+# 있어서 3.9 환경에서는 소스 빌드로 넘어가 설치가 통째로 실패한다.
+yfinance>=0.2.40,<0.2.58
 xlrd>=2.0

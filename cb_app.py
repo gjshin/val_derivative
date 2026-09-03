@@ -756,7 +756,13 @@ def fetch_prices(code: str, days: int, market: str, end: str = None):
     auto_adjust=True 라 유상증자·액면분할·배당이 반영된 종가가 온다.
     국내 종목은 코스닥 .KQ, 코스피 .KS 를 차례로 시도한다.
     """
-    import yfinance as yf
+    try:
+        import yfinance as yf
+    except ImportError:
+        raise RuntimeError(
+            "yfinance 가 설치되어 있지 않습니다. requirements.txt 에 "
+            "yfinance>=0.2.40,<0.2.58 을 넣고 앱을 다시 시작하십시오. "
+            "그동안은 아래에서 주가 파일을 넣으시면 됩니다.") from None
     d2 = dt.date.fromisoformat(end) if end else dt.date.today()
     d1 = d2 - dt.timedelta(days=int(days*1.7)+30)
     sufs = [""] if not code.isdigit() else ([f".{market}"] if market else [".KQ", ".KS"])
@@ -948,7 +954,13 @@ def read_kisnet(name: str, data: bytes):
     """
     ext = name.lower().rsplit(".", 1)[-1]
     if ext == "xls":
-        import xlrd                                  # 옛 형식은 xlrd 만 읽는다
+        try:
+            import xlrd                              # 옛 형식은 xlrd 만 읽는다
+        except ImportError:
+            raise ValueError(
+                "옛 형식(.xls)을 읽으려면 xlrd 가 필요합니다. requirements.txt 에 "
+                "xlrd>=2.0 을 넣고 앱을 다시 시작하시거나, 엑셀에서 .xlsx 로 "
+                "저장해 다시 넣으십시오.") from None
         sh = xlrd.open_workbook(file_contents=data).sheet_by_index(0)
         grid = [[sh.cell_value(r, c) for c in range(sh.ncols)]
                 for r in range(sh.nrows)]
@@ -3341,7 +3353,9 @@ with tabs[4]:
     st.pyplot(fig, use_container_width=True)
     if not _kf:
         st.caption("한글 글꼴이 없어 그림만 영문으로 그렸습니다. 표와 설명은 그대로입니다. "
-                   "서버에 `fonts-nanum` 을 설치하면 한글로 나옵니다.")
+                   "한글로 보시려면 저장소에 `packages.txt` 를 만들어 `fonts-nanum` "
+                   "한 줄을 넣으십시오. 다만 apt 설치가 실패하면 앱이 아예 뜨지 "
+                   "않으므로, 넣으신 뒤 재시작이 되는지 확인하십시오.")
     D = full["dist"]; tot = D["conv"]+D["put"]+D["call"]+D["mat"] or 1
     st.dataframe(pd.DataFrame([
         ["전환", D["conv"]/tot, D["tc"]/D["conv"]/full["mper"] if D["conv"] else None],
