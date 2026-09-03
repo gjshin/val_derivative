@@ -79,11 +79,16 @@ def accrue_rate(t_year: float, g: float, c: float, m: int) -> float:
 
     표면이자율 c 를 빼는 것은 그만큼 이미 현금으로 지급했기 때문이다.
     c 가 0 이면 (1+g/m)^(mt) − 1 로 줄어 종전 산식과 같아진다.
+
+    보장수익률이 표면이자율보다 낮으면 산식이 음수가 된다. 그러나 할증금은
+    수익률을 채워 주려고 **더** 얹는 돈이라 음수가 될 수 없다 — 이미 지급한
+    이자를 만기에 되돌려 받는 계약은 없다. 그래서 0 에서 끊는다. 그런
+    입력은 애초에 잘못이므로 validate() 가 따로 경고한다.
     """
     if t_year <= 0: return 0.0
     m = max(1, int(m))
-    if g <= 1e-12: return (g - c)*t_year        # g → 0 극한
-    return (g - c)/g * ((1 + g/m)**(m*t_year) - 1)
+    if g <= 1e-12: return max(0.0, (g - c)*t_year)   # g → 0 극한
+    return max(0.0, (g - c)/g * ((1 + g/m)**(m*t_year) - 1))
 
 
 def step_mapper(tm: "Terms", n: int, dt_: float):
@@ -652,6 +657,18 @@ def validate(tm: Terms):
     if tm.p_s > tm.p_e: w.append("조기상환 시작이 종료보다 늦습니다.")
     if tm.k_s > tm.k_e: w.append("매도청구 시작이 종료보다 늦습니다.")
     if tm.k_lock < tm.k_e: w.append("의무보유 전환지연이 매도청구 종료보다 이릅니다. 콜이 실효화될 수 있습니다.")
+    # 할증금 산식은 보장수익률에서 표면이자율을 뺀다. 보장이 더 낮으면 음수가
+    # 되어 상환금액이 액면 밑으로 내려간다. 0 에서 끊고는 있지만 입력 자체가
+    # 계약과 맞지 않으므로 알려 준다.
+    if tm.ytm > 0 and tm.ytm < tm.cpn - 1e-9:
+        w.append(f"만기보장수익률({tm.ytm:.2%})이 표면이자율({tm.cpn:.2%})보다 낮습니다. "
+                 "상환할증금이 음수가 되어 0 으로 끊었습니다. 계약서를 확인하십시오.")
+    if tm.p_mode == "accrue" and tm.p_yield > 0 and tm.p_yield < tm.cpn - 1e-9:
+        w.append(f"조기상환 보장수익률({tm.p_yield:.2%})이 표면이자율({tm.cpn:.2%})보다 "
+                 "낮습니다. 조기상환금액이 액면 밑으로 내려갑니다.")
+    if tm.k_w > 0 and tm.k_prem > 0 and tm.k_prem < tm.cpn - 1e-9:
+        w.append(f"매도청구 프리미엄({tm.k_prem:.2%})이 표면이자율({tm.cpn:.2%})보다 "
+                 "낮습니다. 매도청구금액이 액면 밑으로 내려갑니다.")
     if tm.floor > tm.K0: w.append("최저 조정가액이 최초 전환가액보다 큽니다.")
     if tm.par > tm.floor: w.append("액면가가 최저 조정가액보다 큽니다. 액면가가 하한으로 작동합니다.")
     if tm.rfx_mode > 0 and round(tm.rfx_cyc*tm.n/(tm.T*12)) < 1:
@@ -1975,8 +1992,10 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         ("만기보장수익률", "ytm", tm.ytm, P2, True),
         ("만기보장 복리 횟수", "ycm", tm.ytm_cmp, N0, True),
         ("만기상환금액", "red",
-         "@=IF(C{ytm}<=0,100+(C{ytm}-C{cpn})*100*(C{T}+C{elm}/12),"
-         "100*(1+(C{ytm}-C{cpn})/C{ytm}*((1+C{ytm}/C{ycm})^(C{ycm}*(C{T}+C{elm}/12))-1)))", N2, False),
+         # 할증금은 음수가 될 수 없다. 엔진의 accrue_rate 와 같이 0 에서 끊는다.
+         "@=IF(C{ytm}<=0,100*(1+MAX(0,(C{ytm}-C{cpn})*(C{T}+C{elm}/12))),"
+         "100*(1+MAX(0,(C{ytm}-C{cpn})/C{ytm}*"
+         "((1+C{ytm}/C{ycm})^(C{ycm}*(C{T}+C{elm}/12))-1))))", N2, False),
         ("최저 조정가액", "flr", tm.floor, N2, True),
         ("액면가", "par", tm.par, N2, True),
         ("리픽싱 상한", "cap", "@=C{K0}", N2, False),
@@ -2056,13 +2075,13 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
                  f"MOD({st}-{K['roff']},{K['cyc']})=0),1,0)", N0, RED)
             # 상환할증금 = (g−c)/g × ((1+g/m)^(m·t) − 1).  g 가 0 이면 (g−c)·t
             g(7, f"=IF({L}$4=1,IF({K['pyld']}>0,"
-                 f"100*(1+({K['pyld']}-{K['cpn']})/{K['pyld']}*"
-                 f"((1+{K['pyld']}/{K['pcmp']})^({K['pcmp']}*{yr})-1)),"
+                 f"100*(1+MAX(0,({K['pyld']}-{K['cpn']})/{K['pyld']}*"
+                 f"((1+{K['pyld']}/{K['pcmp']})^({K['pcmp']}*{yr})-1))),"
                  f"{K['prate']}),0)", N2)
             g(8, f"=IF({L}$5=1,IF({K['prem']}>0,"
-                 f"100*(1+({K['prem']}-{K['cpn']})/{K['prem']}*"
-                 f"((1+{K['prem']})^{yr}-1)),"
-                 f"100-{K['cpn']}*100*{yr}),999999)", N2)
+                 f"100*(1+MAX(0,({K['prem']}-{K['cpn']})/{K['prem']}*"
+                 f"((1+{K['prem']})^{yr}-1))),"
+                 f"100*(1+MAX(0,-{K['cpn']}*{yr}))),999999)", N2)
             g(9, f"=IF(AND({st}>0,MOD({st},{K['ipay']})=0),"
                  f"100*{K['cpn']}*{K['ipaym']}/12,0)", N2)
             g(10, f"=IF({st}={K['n']},{K['red']},0)", N2)
@@ -2393,8 +2412,8 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         g(6, f"=IF(AND({st}>={K['pst']},{st}<={K['pen']},"
              f"MOD({st}-{K['pst']},{K['frq']})=0),1,0)", N0)
         g(7, f"=IF({L}$6=1,IF({K['pyld']}>0,"
-             f"100*(1+({K['pyld']}-{K['cpn']})/{K['pyld']}*"
-             f"((1+{K['pyld']}/{K['pcmp']})^({K['pcmp']}*{yr})-1)),"
+             f"100*(1+MAX(0,({K['pyld']}-{K['cpn']})/{K['pyld']}*"
+             f"((1+{K['pyld']}/{K['pcmp']})^({K['pcmp']}*{yr})-1))),"
              f"{K['prate']}),0)", N2)
         g(8, f"=IF(AND({st}>0,MOD({st},{K['ipay']})=0),"
              f"100*{K['cpn']}*{K['ipaym']}/12,0)", N2)
@@ -3466,6 +3485,87 @@ with tabs[7]:
                            f"(비율 {min(_rat):.3f} ~ {max(_rat):.3f}). 행사가 "
                            "확정적이라 금리를 확률변수로 두어도 판단이 바뀌지 않습니다. "
                            "확정 계산으로 충분합니다.")
+
+    st.markdown("**신용스프레드가 발행조건과 맞는가**")
+    st.caption("발행일에는 투자자가 100 을 내고 사채 + 조기상환권 + 전환권을 삽니다. "
+               "그러니 전체 가치가 100 이어야 합니다. 크게 벗어나면 인풋이 발행조건과 "
+               "어긋난 것이고, 대개 위험할인율(신용스프레드) 추정이 원인입니다. "
+               "**전체가 100 이 되는 할인율을 역산해** 넣으신 값과 견줍니다.")
+    if t.elapsed_m > 0.01:
+        st.info(f"평가기준일이 발행일보다 {t.elapsed_m:.1f}개월 뒤입니다. 그 사이 주가와 "
+                "신용도가 바뀌었으므로 전체가 100 을 벗어나는 것이 정상입니다. "
+                f"현재 전체 {b2:,.2f}. 역산은 발행일 평가에서만 돌립니다.")
+    elif len(t.cr_curve) < 2:
+        st.info("위험 곡선을 두 점 이상 넣으셔야 역산할 수 있습니다.")
+    else:
+        _lv = [y for _, y in t.cr_curve]
+        _sh = lambda d: [(x, y+d) for x, y in t.cr_curve]
+
+        def _tot(d):
+            tt = Terms(**asdict(t)); tt.cr_curve = _sh(d)
+            derive(tt); return decompose(tt)[3]
+        try:
+            _a, _b = -min(_lv)+1e-4, 0.60          # 곡선을 평행이동할 폭
+            if _tot(_b) > 100:
+                # 스프레드를 아무리 올려도 못 내려간다 — 사채요소가 아니라
+                # 전환조건이 값을 떠받치고 있다는 뜻이다.
+                _flr = _tot(_b)
+                st.warning(
+                    f"신용스프레드를 60%p 올려도 전체가 {_flr:,.2f} 아래로 "
+                    f"내려가지 않습니다 (현재 {b2:,.2f}). 사채요소를 거의 0 으로 "
+                    "만들어도 그만큼이 남는다는 뜻이므로, **원인은 신용이 아니라 "
+                    "전환조건**입니다. 주가 ÷ 전환가액 "
+                    f"{t.S0/max(t.K0,1e-9):.2f}, 변동성 {t.sig:.1%}, "
+                    f"리픽싱 {'있음' if t.rfx_mode else '없음'} 을 먼저 보십시오. "
+                    "메자닌은 투자자에게 유리하게 발행되는 경우가 많아 실제로 "
+                    "100 을 넘기도 합니다 — 그러면 그 사실을 조서에 적으면 됩니다.")
+            elif _tot(_a) < 100:
+                st.warning(
+                    f"스프레드를 0 까지 낮춰도 전체가 100 에 못 미칩니다 "
+                    f"(현재 {b2:,.2f}). 만기보장수익률이나 행사조건이 빠지지 "
+                    "않았는지 확인하십시오.")
+            else:
+                for _ in range(36):
+                    _m = (_a+_b)/2
+                    if _tot(_m) > 100: _a = _m
+                    else: _b = _m
+                _d = (_a+_b)/2
+                _t2 = Terms(**asdict(t)); _t2.cr_curve = _sh(_d)
+                derive(_t2)
+                _f2, _z0, _z1, _z2, _zc, _zv = decompose(_t2)
+                _RF2, _CR2 = curves(_t2)
+                st.dataframe(pd.DataFrame([
+                    ["넣으신 위험이자율 (잔존만기)", f"{CRc(t.T)*100:.2f}%",
+                     f"전체 {b2:,.2f}"],
+                    ["역산된 위험이자율", f"{_CR2(t.T)*100:.2f}%", "전체 100.00"],
+                    ["차이 (곡선 평행이동)", f"{_d*100:+.2f}%p", ""],
+                    ["역산 상태의 조기상환권", f"{_z1-_z0:,.2f}",
+                     f"현재 {b1-b0:,.2f}"],
+                    ["역산 상태의 전환권대가", f"{_zv:,.2f}", f"현재 {conv:,.2f}"]],
+                    columns=["항목", "값", "참고"]),
+                    use_container_width=True, hide_index=True)
+                if abs(b2-100) < 1.0:
+                    st.success("전체가 발행가액과 거의 맞습니다. 인풋이 발행조건과 "
+                               "정합적입니다.")
+                elif b2 > 100:
+                    st.warning(
+                        f"전체가 발행가액보다 {b2-100:,.2f} 큽니다. 그만큼을 "
+                        "투자자가 공짜로 받은 셈이라 발행조건과 맞지 않습니다. "
+                        f"**신용스프레드를 {_d*100:.2f}%p 낮게 잡았을 소지가 큽니다.** "
+                        "위 조기상환권 진단에서 등가격이 잡혔다면, 역산값을 쓰면 "
+                        "내가격으로 돌아서 등가격 문제 자체가 사라지는지 먼저 "
+                        "확인하십시오.")
+                else:
+                    st.warning(
+                        f"전체가 발행가액보다 {100-b2:,.2f} 작습니다. 스프레드를 "
+                        "높게 잡았거나, 리픽싱·조기상환 같은 조건이 빠졌을 수 "
+                        "있습니다.")
+        except Exception as _ex:
+            st.info(f"역산하지 못했습니다 — {_ex}")
+        st.caption("역산값을 그대로 쓰라는 뜻은 아닙니다. 시장에서 관측한 등급 "
+                   "수익률을 쓰는 것이 원칙이고, 역산은 **인풋이 발행조건과 얼마나 "
+                   "떨어져 있는지 재는 자**입니다. 괴리가 크면 등급 추정이나 "
+                   "만기보장수익률 입력을 다시 보십시오.")
 
     st.markdown("**금리모형(BDT 등) 적용 필요여부**")
     RFc, CRc = curves(t)
