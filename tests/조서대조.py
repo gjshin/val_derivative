@@ -42,6 +42,17 @@ CASES = [
      dict(_gap=1., k_method=1, conv_class="liability", d_issue="2025-05-23",
           d_base="2025-06-30", d_mat="2027-08-23", cv_s=12., cv_e=26., p_s=12.,
           p_e=24., k_s=6., k_e=18., k_lock=20., rfx_cyc=7.)),
+    # 조기상환권을 BDT 금리격자로 잴 때. 자본·TF 에서만 열린다.
+    ("BDT σ=20% · 위험곡선", dict(put_bdt=1, bdt_sig=.20)),
+    ("BDT σ=20% · 무위험+스프레드", dict(put_bdt=1, bdt_sig=.20, bdt_base=1)),
+    ("BDT σ=0 · 확정 격자와 같아야", dict(put_bdt=1, bdt_sig=0.0)),
+    ("BDT 등가격 (보장=할인)",
+     dict(put_bdt=1, bdt_sig=.20, S0=450., ytm=.08, ytm_cmp=4,
+          p_mode="accrue", p_yield=.08, p_cmp=4,
+          _cr=[(0.25, .08), (1, .08), (3, .08), (5, .08)])),
+    ("BDT · 표면3% 보장7%",
+     dict(put_bdt=1, bdt_sig=.20, cpn=.03, ytm=.07, ipay=6., ytm_cmp=2,
+          p_mode="accrue", p_yield=.07)),
     ("월 노드 · 리픽싱 7스텝 · GS",
      dict(_gap=1., model="GS", d_issue="2025-05-23", d_base="2025-06-30",
           d_mat="2027-08-23", cv_s=12., cv_e=26., p_s=12., p_e=24.,
@@ -86,8 +97,9 @@ def build(G, over, path):
     # _gap 은 노드 간격만 바꾸는 검사용 키다. 리픽싱 주기가 살아나는
     # 촘촘한 격자를 만들 때 쓴다.
     t.carry = 1; t.gap_m = over.get("_gap", 6.0)
+    if "_cr" in over: t.cr_curve = over["_cr"]
     for k, v in over.items():
-        if k != "_gap": setattr(t, k, v)
+        if k not in ("_gap", "_cr"): setattr(t, k, v)
     derive(t)
     full, b0, b1, b2, ca, conv = decompose(t)
     b3 = G["pick"](G["engine"](t, conv=True, put=True, call=True,

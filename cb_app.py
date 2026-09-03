@@ -67,6 +67,9 @@ class Terms:
     rt_b: str = "BBB-"            # 인풋 곡선 B 등급
     rt_tgt: str = "BBB0"          # 평가대상 등급
     cr_curve_b: list = field(default_factory=list)
+    put_bdt: int = 0              # 조기상환권 0 격자(확정) / 1 BDT 금리격자
+    bdt_sig: float = 0.20         # BDT 단기이자율 변동성 (로그정규, 연)
+    bdt_base: int = 0             # 0 위험 곡선 직접 / 1 무위험 + 확정 스프레드
     y_type: str = "par"           # par 만기수익률 / spot 현물이자율
     rf_curve: list = field(default_factory=list)   # [(만기, 연이율)]
     cr_curve: list = field(default_factory=list)
@@ -512,11 +515,140 @@ K_METHODS = {0: "유무가치비교법", 1: "옵션차익혼합할인법 · 혼�
              2: "옵션차익혼합할인법 · 지분·부채 분리"}
 
 
+# ══════════════════════════════════════════════════════════
+# 3-1. BDT 금리격자 — 조기상환권 전용
+# ══════════════════════════════════════════════════════════
+# 전환을 끄면 격자가 주가와 무관해져 스텝마다 값이 하나뿐이다. 즉 지금
+# 조기상환권은 불확실성이 없는 확정 계산이고 옵션의 시간가치가 없다.
+# 금리를 확률변수로 두면 그 시간가치가 생긴다. 조기상환권은 주가와 무관한
+# 순수 금리·신용 상품이라, 주가 격자를 건드리지 않고 여기서만 따로 잰다.
+
+
+def bdt_tree(spot, T: float, n: int, sig: float):
+    """현물이자율 곡선에 맞춘 BDT 단기이자율 격자.
+
+        r(i, j) = a_i · exp(2·σ·j·√Δt)          j 는 상승 횟수 (0..i)
+
+    로그정규라 이자율이 음수가 되지 않는다. a_i 는 (i+1)Δt 만기 무이표채를
+    정확히 재현하도록 역산한다 — 그래서 옵션이 없는 사채는 곡선을 그대로
+    되돌려 준다. 위험중립확률은 BDT 관행대로 0.5 다.
+
+    σ 가 0 이면 a_i 가 구간 선도이자율이 되어 확정 격자와 완전히 같아진다.
+    이 성질을 검사에서 쓴다.
+    """
+    dt_ = T/max(1, n)
+    sq = math.sqrt(dt_)
+    P = [math.exp(-spot(k*dt_)*k*dt_) for k in range(n+1)]   # 시장 할인계수
+    r, base, Q = [], [], [[1.0]]                             # Q 는 도달가격
+    for i in range(n):
+        mul = [math.exp(2*sig*j*sq) for j in range(i+1)]
+        def price(a):
+            return sum(Q[i][j]*math.exp(-a*mul[j]*dt_) for j in range(i+1))
+        lo, hi = 1e-10, 5.0                    # 연 500% 까지 잡으면 넉넉하다
+        for _ in range(200):                   # price 는 a 에 대해 감소한다
+            mid = (lo+hi)/2
+            if price(mid) > P[i+1]: lo = mid
+            else: hi = mid
+        a = (lo+hi)/2
+        base.append(a)
+        r.append([a*x for x in mul])
+        nq = [0.0]*(i+2)
+        for j in range(i+1):
+            d = 0.5*Q[i][j]*math.exp(-r[i][j]*dt_)
+            nq[j+1] += d; nq[j] += d
+        Q.append(nq)
+    return r, base
+
+
+def bdt_parts(tm: Terms):
+    """BDT 격자에서 쓸 재료를 한곳에서 만든다. 조서도 이것을 그대로 쓴다.
+
+    기준 곡선은 두 가지로 고를 수 있다.
+
+    * 0 위험 곡선 직접 — 단기이자율이 곧 위험이자율이다. σ 가 위험이자율
+      전체의 변동성이라 신용스프레드 변동성까지 안고 간다. 옵션 없는 사채가
+      격자의 주계약과 정확히 같아져 검산이 쉽다.
+    * 1 무위험 + 확정 스프레드 — 국고채에 σ 를 태우고 구간 선도 스프레드를
+      확정으로 얹는다. σ 를 국고채에서 관측한 값으로 쓸 수 있지만,
+      스프레드가 금리와 무관하다고 본 것이므로 그 한계를 조서에 적어야 한다.
+    """
+    derive(tm)
+    RF, CR = curves(tm)
+    n, T = int(tm.n), tm.T
+    dt_ = T/n
+    ey = tm.elapsed_m/12
+    mper = n/(T*12)
+    st_lo, st_hi = step_mapper(tm, n, dt_)
+    if tm.bdt_base == 0:
+        rt, ab = bdt_tree(CR, T, n, tm.bdt_sig)
+        add = [0.0]*n
+    else:
+        rt, ab = bdt_tree(RF, T, n, tm.bdt_sig)
+        add = [forward_rate(CR, i*dt_, (i+1)*dt_) - forward_rate(RF, i*dt_, (i+1)*dt_)
+               for i in range(n)]
+    red = 100*(1 + accrue_rate(T + ey, tm.ytm, tm.cpn, tm.ytm_cmp))
+    cpn_amt = 100*tm.cpn*tm.ipay/12
+    pay_per = max(1, int(round(tm.ipay*mper)))
+    is_pay = lambda i: tm.cpn > 0 and i > 0 and i % pay_per == 0
+    p_lo, p_hi = st_lo(tm.p_s), st_hi(tm.p_e)
+    p_per = max(1, int(round(tm.p_f*mper)))
+    in_put = lambda i: (max(p_lo, 0) <= i <= p_hi and (i-p_lo) % p_per == 0)
+    put_a = lambda i: ((100*(1 + accrue_rate(i*dt_ + ey, tm.p_yield, tm.cpn, tm.p_cmp))
+                        if tm.p_mode == "accrue" else tm.p_rate)
+                       if in_put(i) else 0.0)
+    return dict(r=rt, a=ab, add=add, n=n, T=T, dt=dt_, red=red, cpn=cpn_amt,
+                is_pay=is_pay, in_put=in_put, put_a=put_a)
+
+
+def bdt_grid(tm: Terms, put: bool):
+    """BDT 격자에서 사채를 역진하고 전 노드 값을 돌려준다.
+
+    만기 노드와 중간 노드의 판정을 격자 엔진과 같은 순서로 맞춘다 —
+    만기는 MAX(조기상환금액, 만기상환금액) + 쿠폰, 중간은 MAX(계속보유,
+    조기상환금액) 이다. 조서가 표를 그릴 때 이 격자를 그대로 쓴다.
+    """
+    B = bdt_parts(tm)
+    n, dt_ = B["n"], B["dt"]
+    cm = B["cpn"] if B["is_pay"](n) else 0.0
+    V = [[0.0]*(i+1) for i in range(n+1)]
+    for j in range(n+1):
+        V[n][j] = max(B["put_a"](n) if put else 0.0, B["red"]) + cm
+    for i in range(n-1, -1, -1):
+        c = B["cpn"] if B["is_pay"](i) else 0.0
+        for j in range(i+1):
+            d = math.exp(-(B["r"][i][j] + B["add"][i])*dt_)
+            h = (0.5*V[i+1][j+1] + 0.5*V[i+1][j])*d + c
+            if put and B["in_put"](i): h = max(h, B["put_a"](i))
+            V[i][j] = h
+    return B, V
+
+
+def bond_bdt(tm: Terms, put: bool) -> float:
+    """BDT 격자에서 잰 사채 가치 (t=0)."""
+    return bdt_grid(tm, put)[1][0][0]
+
+
+def put_bdt_on(tm: Terms) -> bool:
+    """BDT 를 실제로 쓸 조건인가.
+
+    전환권을 자본으로 두고 TF 를 쓸 때만 연다. 자본이면 전환권대가가 잔여라
+    부채요소만 바꿔도 배분이 그대로 성립하지만, 부채로 두면 복합내재파생을
+    전체로서 재야 해서 전체 가치(주가 격자)까지 같이 손봐야 하기 때문이다.
+    """
+    return bool(tm.put_bdt) and tm.conv_class == "equity" and tm.model == "TF" \
+        and tm.p_s <= tm.p_e
+
+
 def decompose(tm: Terms):
     derive(tm)
     full = engine(tm, call=False)
     b0 = pick(engine(tm, conv=False, put=False, call=False), tm.model)
     b1 = pick(engine(tm, conv=False, put=True, call=False), tm.model)
+    # 조기상환권을 BDT 로 재면 부채요소만 갈아 끼운다. 전환권이 자본이면
+    # 전환권대가가 잔여라 배분이 그대로 성립하고 합계도 100 을 지킨다.
+    # 전체 가치(b2)는 주가 격자 그대로 두므로, 그 차이는 잔여가 흡수한다.
+    if put_bdt_on(tm):
+        b1 = bond_bdt(tm, True)
     b2 = pick(full, tm.model)
     # 행사 가능한 시점이 하나도 없으면 매도청구권은 없다.
     ks = full["kstrike"]
@@ -669,6 +801,21 @@ def validate(tm: Terms):
     if tm.k_w > 0 and tm.k_prem > 0 and tm.k_prem < tm.cpn - 1e-9:
         w.append(f"매도청구 프리미엄({tm.k_prem:.2%})이 표면이자율({tm.cpn:.2%})보다 "
                  "낮습니다. 매도청구금액이 액면 밑으로 내려갑니다.")
+    if put_bdt_on(tm):
+        if tm.bdt_sig <= 0:
+            w.append("BDT 변동성이 0 입니다. 금리 고정 격자와 같은 값이 나옵니다.")
+        elif tm.bdt_sig > 1.0:
+            w.append(f"BDT 변동성이 {tm.bdt_sig:.0%} 입니다. 로그정규 변동성이라 "
+                     "보통 10~30% 를 씁니다. 단위를 확인하십시오.")
+        try:
+            _g = pick(engine(tm, conv=False, put=True, call=False), tm.model)
+            _b = bond_bdt(tm, True)
+            if _b < _g - 1e-6:
+                w.append(f"BDT 부채요소({_b:,.2f})가 금리 고정 격자({_g:,.2f})보다 "
+                         "작습니다. 옵션가치는 음수가 될 수 없으므로 캘리브레이션을 "
+                         "확인해야 합니다.")
+        except Exception:
+            pass
     if tm.floor > tm.K0: w.append("최저 조정가액이 최초 전환가액보다 큽니다.")
     if tm.par > tm.floor: w.append("액면가가 최저 조정가액보다 큽니다. 액면가가 하한으로 작동합니다.")
     if tm.rfx_mode > 0 and round(tm.rfx_cyc*tm.n/(tm.T*12)) < 1:
@@ -1726,6 +1873,62 @@ def build_xlsx(tm: Terms, full, b0, b1, b2, ca, conv, eir):
             "네 갈래 중 최적을 고른 뒤의 값이다.", "04 · 06")
         fill_tree(T12, lambda i, r: (round(node(i, r)["V"], 2) if node(i, r) else None))
 
+    # ── BDT (조기상환권을 금리격자로 잴 때만) ──
+    if put_bdt_on(tm):
+        BP, BV = bdt_grid(tm, True)
+        _, BV0 = bdt_grid(tm, False)
+        d0 = dt.date.fromisoformat(tm.d_base)
+        for nm, ttl, note, grid, rate in (
+            ("BDT 단기이자율", "BDT 단기이자율격자  r(i,j) = a · exp(2σ·j·√Δt)",
+             "로그정규라 이자율이 음수가 되지 않는다. j 는 상승 횟수이고 클수록 "
+             "금리가 높다 — 주가 트리와 달리 위로 갈수록 낮다. 기준금리 a 는 곡선을 "
+             "정확히 되돌리도록 역산한 값이다.", None, True),
+            ("BDT 부채요소", "BDT 부채요소  전환 없는 사채 + 조기상환권",
+             "MAX(조기상환금액, 계속보유) 를 고른다. 계속보유는 다음 두 칸을 0.5 씩 "
+             "섞어 그 칸의 단기이자율로 할인한 값이다.", BV, False),
+            ("BDT 주계약", "BDT 주계약  옵션이 없는 사채",
+             "조기상환권을 빼고 같은 격자로 굴린 값이다. 곡선을 정확히 되돌리므로 "
+             "⑩ 주계약과 같아야 한다 — 캘리브레이션 검산이다.", BV0, False)):
+            W = wb.create_sheet(nm); W.sheet_view.showGridLines = False
+            W.column_dimensions["B"].width = 18
+            for i in range(n+1): W.column_dimensions[gl(3+i)].width = 9
+            for r, h in enumerate(["Date", "time-step", "Flag(조기상환)", "조기상환금액",
+                                   "쿠폰", "만기상환", "기준금리 a", "확정 스프레드"],
+                                  start=1):
+                put(W, r, 2, h, bold=True, size=8, fill=LIGHT, border=True)
+            for i in range(n+1):
+                g = lambda r, v, fm=None: put(W, r, 3+i, v, fmt=fm,
+                                              align="center", size=8)
+                g(1, d0 + dt.timedelta(days=round(i*dt_*365)), DATE)
+                g(2, i, N0)
+                g(3, 1 if BP["in_put"](i) else 0, N0)
+                g(4, round(BP["put_a"](i), 4), N2)
+                g(5, round(BP["cpn"] if BP["is_pay"](i) else 0.0, 4), N2)
+                g(6, round(BP["red"] if i == n else 0.0, 4), N2)
+                if i < n:
+                    g(7, BP["a"][i], P2); g(8, BP["add"][i], P2)
+            title(W, 10, ttl, span=min(n+1, 14))
+            put(W, 11, 2, note, color=GREY, size=9)
+            put(W, 12, 2, "j ＼ 스텝", bold=True, size=8, fill=LIGHT,
+                border=True, align="center")
+            for i in range(n+1):
+                put(W, 12, 3+i, i, bold=True, size=8, fmt=N0, align="center",
+                    fill=LIGHT, border=True)
+            for j in range(n+1):
+                put(W, 13+j, 2, j, bold=True, size=8, fmt=N0, align="center",
+                    fill=LIGHT, border=True)
+            for i in range(n+1):
+                if rate and i == n: continue          # 만기에는 다음 구간이 없다
+                for j in range(i+1):
+                    v = BP["r"][i][j] if rate else grid[i][j]
+                    put(W, 13+j, 3+i, round(v, 8), fmt=(P2 if rate else N2),
+                        size=8, align="right")
+            if not rate:
+                put(W, 13+n+2, 2, "t = 0", bold=True)
+                put(W, 13+n+2, 3, round(grid[0][0], 6), bold=True, fmt=N2,
+                    align="right")
+            W.freeze_panes = "C13"
+
     # ── 이자율곡선 ──
     C = wb.create_sheet("이자율곡선"); C.sheet_view.showGridLines = False
     for cc, w in (("B", 12), ("C", 14), ("D", 14), ("E", 14), ("F", 14), ("G", 14)):
@@ -2040,6 +2243,9 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
          "kmeth", tm.k_method, N0, True),
         ("매도청구권 처리 (1 별도 금융상품 / 0 내재파생 포함)", "ksep", tm.k_sep, N0, True),
         ("신용위험 처리 (0 TF / 1 GS)", "mdl", 1 if tm.model == "GS" else 0, N0, True),
+        ("조기상환권 (0 금리고정 / 1 BDT)", "pbdt", 1 if put_bdt_on(tm) else 0, N0, True),
+        ("BDT 변동성 σ", "bsig", tm.bdt_sig, P2, True),
+        ("BDT 기준 (0 위험곡선 / 1 무위험+스프레드)", "bbase", tm.bdt_base, N0, True),
         ("전자등록총액 (원)", "face", tm.face_total, N0, True),
         ("무위험 (연속, 평탄)", "rfc", RF(tm.T), P2, False)]
     ROWN = {key: 3+i for i, (_, key, _, _, _) in enumerate(spec)}
@@ -2219,6 +2425,7 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     # ⑤~⑨ 는 TF 트리다. GS 를 골랐어도 옵션차익법(방법 1·2)의 기초자산이라
     # 그때는 남긴다. GS + 유무가치비교법이면 쓰이지 않으므로 만들지 않는다.
     _needTF = (not _gs) or _need1 or _need2
+    _bdt = put_bdt_on(tm)      # 조기상환권을 BDT 로 재는가
     if _needTF:
         W = newsheet(S5, "⑤ 지분가치트리",
                      "전환이면 전환가치, 상환이면 0, 보유면 다음 열을 무위험이자율로 할인.",
@@ -2436,6 +2643,88 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     put(D, 13, 2, "부채요소 (t=0)", bold=True)
     put(D, 13, 3, "=C11", bold=True, fmt=N2, align="right")
 
+    if _bdt:
+        # ── BDT 단기이자율 · BDT 부채요소 ──
+        # 기준금리 a_i 는 곡선에 맞추려고 역산한 값이라 수식으로 펼 수 없다.
+        # 선도이자율과 같은 자리다. 격자와 역진은 전부 수식이다.
+        BP, BV = bdt_grid(tm, True)
+        SB1, SB2 = "BDT 단기이자율", "BDT 부채요소"
+        RB = 14                                  # 표 첫 자료행 (j = 0)
+
+        def bhead(W, ttl, note):
+            W.sheet_view.showGridLines = False
+            W.column_dimensions["B"].width = 20
+            for i in range(n+1): W.column_dimensions[gl(3+i)].width = 9
+            title(W, 2, ttl, span=min(n+1, 14))
+            put(W, 3, 2, note, color=GREY, size=9)
+            for r, nm in enumerate(["Date", "time-step", "Flag(조기상환)", "조기상환금액",
+                                    "쿠폰", "만기상환", "기준금리 a", "확정 스프레드"],
+                                   start=4):
+                put(W, r, 2, nm, bold=True, size=8, fill=LIGHT, border=True)
+            for i in range(n+1):
+                L = gl(3+i); Lp = gl(2+i) if i > 0 else None
+                g = lambda r, v, fm=None, col="000000": put(W, r, 3+i, v, fmt=fm,
+                                                            align="center", size=8, color=col)
+                st = f"{L}$5"
+                yr = f"({st}*{K['dt']}+{K['elm']}/12)"
+                g(4, f"={K['d_base']}+{st}*{K['dt']}*365", DATE, GREY)
+                g(5, (0 if i == 0 else f"={Lp}$5+1"), N0)
+                g(6, f"=IF(AND({st}>={K['pst']},{st}<={K['pen']},"
+                     f"MOD({st}-{K['pst']},{K['frq']})=0),1,0)", N0)
+                g(7, f"=IF({L}$6=1,IF({K['pyld']}>0,"
+                     f"100*(1+MAX(0,({K['pyld']}-{K['cpn']})/{K['pyld']}*"
+                     f"((1+{K['pyld']}/{K['pcmp']})^({K['pcmp']}*{yr})-1))),"
+                     f"{K['prate']}),0)", N2)
+                g(8, f"=IF(AND({st}>0,MOD({st},{K['ipay']})=0),"
+                     f"100*{K['cpn']}*{K['ipaym']}/12,0)", N2)
+                g(9, f"=IF({st}={K['n']},{K['red']},0)", N2)
+                if i < n:
+                    g(10, BP["a"][i], P2, AMB)
+                    g(11, BP["add"][i], P2, AMB)
+            put(W, RB-1, 2, "j ＼ 스텝", bold=True, size=8, fill=LIGHT,
+                border=True, align="center")
+            for i in range(n+1):
+                put(W, RB-1, 3+i, i, bold=True, size=8, fmt=N0, align="center",
+                    fill=LIGHT, border=True)
+            for j in range(n+1):
+                put(W, RB+j, 2, j, bold=True, size=8, fmt=N0, align="center",
+                    fill=LIGHT, border=True)
+            W.freeze_panes = f"C{RB}"
+
+        W = wb.create_sheet(SB1)
+        bhead(W, "BDT 단기이자율격자  r(i,j) = a · exp(2σ·j·√Δt)",
+              "로그정규라 이자율이 음수가 되지 않는다. j 는 상승 횟수이고 클수록 "
+              "금리가 높다 — 주가 트리와 달리 위로 갈수록 낮다. 기준금리 a 는 곡선을 "
+              "정확히 되돌리도록 역산한 값이라 주황색이다. σ 를 바꾸시려면 앱에서 "
+              "조서를 다시 만드셔야 한다.")
+        for i in range(n):
+            L = gl(3+i)
+            for j in range(i+1):
+                put(W, RB+j, 3+i,
+                    f"={L}$10*EXP(2*{K['bsig']}*$B{RB+j}*SQRT({K['dt']}))",
+                    fmt=P2, size=8, align="right")
+
+        W = wb.create_sheet(SB2)
+        bhead(W, "BDT 부채요소  전환 없는 사채 + 조기상환권",
+              "MAX(조기상환금액, 계속보유) 를 고른다. 계속보유는 다음 두 칸을 "
+              "0.5 씩 섞어 그 칸의 단기이자율로 할인한 값이다. 확정 격자와의 차이가 "
+              "곧 금리에서 나오는 옵션의 시간가치다.")
+        for i in range(n, -1, -1):
+            L = gl(3+i); Ln = gl(4+i) if i < n else None
+            for j in range(i+1):
+                if i == n:
+                    v = f"=MAX({L}$7,{L}$9)+{L}$8"
+                else:
+                    d = f"EXP(-('{SB1}'!{L}{RB+j}+{L}$11)*{K['dt']})"
+                    v = (f"=MAX({L}$7,(0.5*{Ln}{RB+j+1}+0.5*{Ln}{RB+j})*{d}+{L}$8)")
+                put(W, RB+j, 3+i, v, fmt=N2, size=8, align="right")
+        put(W, RB+n+2, 2, "부채요소 (t=0)", bold=True)
+        put(W, RB+n+2, 3, f"=C{RB}", bold=True, fmt=N2, align="right")
+        put(W, RB+n+3, 2, "금리 고정 격자 (⑯)", bold=True)
+        put(W, RB+n+3, 3, f"={Q(S16)}!C13", fmt=N2, align="right")
+        put(W, RB+n+4, 2, "차이 = 금리에서 나온 옵션가치", bold=True)
+        put(W, RB+n+4, 3, f"=C{RB+n+2}-C{RB+n+3}", bold=True, fmt=N2, align="right")
+
     if _need1 or _need2:
         # ── 17~20 옵션차익혼합할인법 ──
         # 제3자 지정 가능 콜옵션은 전환사채를 기초자산으로 하는 복합옵션이다.
@@ -2535,7 +2824,8 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     put(R, 15, 4, "전액 기준 (원)", bold=True, fill=LIGHT, align="center", border=True)
     put(R, 15, 5, "공시", bold=True, fill=LIGHT, align="center", border=True)
     items = [("주계약", f"={Q(S10)}!C{R0}"),
-             ("부채요소 (사채 + 조기상환권)", f"={Q(S16)}!C13"),
+             ("부채요소 (사채 + 조기상환권)",
+              f"='BDT 부채요소'!C{14+n+2}" if _bdt else f"={Q(S16)}!C13"),
              ("조기상환청구권", "=C17-C16"),
              ("매도청구권 · 유무가치비교법",
               f"={K['cw']}*(C10-C11)" if _need15 else B_),
@@ -2905,6 +3195,38 @@ with st.sidebar:
             t.p_yield = st.number_input("조기상환 보장수익률 (%)", value=t.p_yield*100, step=0.5)/100
             t.p_cmp = int(st.number_input("복리 횟수 (연)", value=int(t.p_cmp), step=1, min_value=1))
             st.caption("행사금액 = 100 × (1 + 실효수익률)^경과연수")
+
+        st.divider()
+        st.markdown("**평가 방법**")
+        _ok = (t.conv_class == "equity" and t.model == "TF" and t.p_s <= t.p_e)
+        t.put_bdt = int(st.checkbox(
+            "BDT 금리격자로 평가", value=bool(t.put_bdt), disabled=not _ok,
+            help="전환을 끄면 격자가 주가와 무관해져 조기상환권이 확정 계산이 "
+                 "됩니다. 금리를 확률변수로 두면 옵션의 시간가치가 생깁니다."))
+        if not _ok:
+            st.caption("전환권을 **자본**으로 두고 **TF** 를 쓸 때만 켤 수 있습니다. "
+                       "자본이면 전환권대가가 잔여라 부채요소만 바꿔도 배분이 "
+                       "성립하지만, 부채이면 복합내재파생을 전체로서 재야 해서 "
+                       "전체 가치까지 함께 손봐야 합니다.")
+        elif t.put_bdt:
+            t.bdt_sig = st.number_input("단기이자율 변동성 (%)",
+                                        value=t.bdt_sig*100, step=1.0,
+                                        min_value=0.0, key="bdtsig")/100
+            t.bdt_base = st.selectbox(
+                "기준 곡선", [0, 1], index=int(t.bdt_base),
+                format_func=lambda x: ("위험 곡선에 직접" if x == 0
+                                       else "무위험 + 확정 스프레드"))
+            if t.bdt_base == 0:
+                st.caption("단기이자율이 곧 위험이자율입니다. 변동성이 신용스프레드 "
+                           "변동까지 안고 갑니다. 옵션 없는 사채가 격자의 주계약과 "
+                           "정확히 같아져 검산이 쉽습니다.")
+            else:
+                st.caption("국고채에 변동성을 태우고 구간 선도 스프레드를 확정으로 "
+                           "얹습니다. 변동성을 국고채에서 관측한 값으로 쓸 수 있지만, "
+                           "**스프레드가 금리와 무관하다고 본 것**이므로 그 한계를 "
+                           "조서에 적으십시오.")
+            st.caption("로그정규 변동성입니다. 실무에서는 10~30% 를 씁니다. "
+                       "0 이면 지금과 같은 값이 나옵니다.")
 
     with st.expander("매도청구권"):
         t.k_s = st.number_input("시작 (개월)", value=float(t.k_s), step=1.0, key="ks")
