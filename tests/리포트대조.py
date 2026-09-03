@@ -147,9 +147,44 @@ def rate_cases(G):
               f"{'OK' if miss == 0 else '★'}")
 
 
+def rate_series(n, r0, sig, seed):
+    """로그정규 랜덤워크로 만든 금리 시계열."""
+    random.seed(seed)
+    d, out, r = dt.date(2024, 1, 2), [], r0
+    for _ in range(n):
+        while d.weekday() >= 5: d += dt.timedelta(days=1)
+        out.append((d.isoformat(), round(r, 4)))
+        d += dt.timedelta(days=1)
+        r *= math.exp(random.gauss(0, sig/math.sqrt(250)))
+    return out
+
+
+def ratevol_cases(G):
+    """금리변동성 리포트 — 상대·절대 둘 다 엔진과 맞는지."""
+    build, rate_vol = G["build_xlsx_vol"], G["rate_vol"]
+    for lbl, kw in [("금리 · 이상치 제거", dict(drop=True)),
+                    ("금리 · 제거 없음", dict(drop=False)),
+                    ("금리 · 거래일수 252", dict(tdays=252))]:
+        tdays = kw.get("tdays", 250); drop = kw.get("drop", True)
+        ser = [("A0·A- → BBB+ 고정만기", rate_series(300, 4.10, .20, 4))]
+        data = build(ser, tdays=tdays, drop=drop, kind="rate",
+                     how="검사용 합성 시계열")
+        got, _ = solve(data, ["01 A0·A- → BBB+ 고정만기"])
+        g = got["01 A0·A- → BBB+ 고정만기"]
+        v = rate_vol(ser[0][1], tdays, drop)
+        print(f"\n[금리변동성 · {lbl}]")
+        chk("상대 일 변동성", g.get("C15"), v["daily"])
+        chk("상대 연 변동성", g.get("C16"), v["annual"])
+        chk("절대 일 변동성", g.get("C17"), v["abs_daily"])
+        chk("절대 연 변동성", g.get("C18"), v["abs_annual"])
+        chk("평균 금리", g.get("C19"), v["mean"])
+        chk("제외 개수", g.get("C14"), float(v["removed"]))
+
+
 def main():
     G = load_app()
     vol_cases(G)
+    ratevol_cases(G)
     rate_cases(G)
     print("\n" + ("모든 항목 일치" if bad == 0 else f"★ {bad}건 불일치"))
     return 1 if bad else 0
