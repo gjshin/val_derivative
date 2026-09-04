@@ -1718,10 +1718,13 @@ def build_xlsx_vol(series, tdays=250, drop=True, mad_k=2.5, pick="median",
 
     # ── 표지 ──
     C = sheet("표지", tab=RPT["ink"], widths=[24, 20, 18, 18, 16, 16, 16, 16])
-    head(C, 2, "변동성 산출내역",
-         "전환사채 평가에 쓸 주가변동성을 로그수익률의 표본표준편차로 구한 내역이다. "
-         "노란 셀만 입력이고 나머지는 수식이라, 거래일수나 이상치 배수를 바꾸면 "
-         "표 전체가 다시 계산된다.")
+    head(C, 2, ("금리변동성 산출내역" if _rate else "변동성 산출내역"),
+         ("BDT 금리격자에 넣을 단기이자율 변동성 σ 를 금리의 로그변화율로 구한 "
+          "내역이다. " if _rate else
+          "전환사채 평가에 쓸 주가변동성을 로그수익률의 표본표준편차로 구한 "
+          "내역이다. ")
+         + "노란 셀만 입력이고 나머지는 수식이라, 거래일수나 이상치 배수를 "
+           "바꾸면 표 전체가 다시 계산된다.")
     r = 5
     sec(C, r, "산출 요약"); r += 1
     cols(C, r, ["항목", "내용"], [26, 62]); r += 1
@@ -1757,13 +1760,17 @@ def build_xlsx_vol(series, tdays=250, drop=True, mad_k=2.5, pick="median",
         r += 2
     r += 1
     note(C, r, "주황색 숫자는 앱이 넣은 값이고 노란 셀은 바꿔도 되는 입력이다. "
-               "종가는 수정주가여야 한다 — 유상증자·액면분할·배당이 반영되지 않은 "
-               "종가를 쓰면 그날 하루가 통째로 이상치가 된다.")
+               + ("금리는 평가 기준 곡선과 같은 등급·같은 잔존만기로 맞춘 "
+                  "고정만기 시계열이어야 한다 — 매일 만기가 줄어드는 특정 종목의 "
+                  "금리를 쓰면 만기 효과가 변동성으로 잡힌다."
+                  if _rate else
+                  "종가는 수정주가여야 한다 — 유상증자·액면분할·배당이 반영되지 "
+                  "않은 종가를 쓰면 그날 하루가 통째로 이상치가 된다."))
 
     # ── 회사별 시트 ──
     for (nm, px), sn in zip(series, names):
         W = sheet(sn, widths=[15, 13, 14, 13, 9, 14], freeze=f"B{R0}")
-        head(W, 2, f"{nm} — 일별 로그수익률", span=6)
+        head(W, 2, f"{nm} — 일별 {RET}", span=6)
         n = len(px); last = R0 + n - 1
         D1, DN = f"$D${R0+1}", f"$D${last}"
         sec(W, 4, "입력과 결과", span=6)
@@ -1892,7 +1899,7 @@ def _save(wb):
     buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
 
 
-def build_xlsx_rate(tm: Terms):
+def build_xlsx_rate(tm: Terms, sig_how: str = ""):
     """선도이자율 산출내역 리포트.
 
     만기수익률 곡선 → 선형보간 → 부트스트래핑 → 연속복리 현물 → 구간 선도.
@@ -1946,7 +1953,7 @@ def build_xlsx_rate(tm: Terms):
     r += 1
     sec(C, r, "설정"); r += 1
     cols(C, r, ["항목", "값"], [26, 24]); r += 1
-    for k, v in [("입력 유형", "현물이자율(제로커브)" if spot_in else "만기수익률(YTM)"),
+    for k, v in ([("입력 유형", "현물이자율(제로커브)" if spot_in else "만기수익률(YTM)"),
                  ("무위험 복리 횟수 (연)", int(tm.cmp_rf)),
                  ("위험 복리 횟수 (연)", int(tm.cmp_cr)),
                  ("위험 곡선 방식", {"pick": "표에서 등급 하나",
@@ -1956,9 +1963,15 @@ def build_xlsx_rate(tm: Terms):
                  ("평가기준일", tm.d_base), ("만기일", tm.d_mat),
                  ("잔존기간 T (년)", round(T, 8)), ("노드 수 n", n),
                  ("한 구간 Δt (년)", round(dt_, 8)),
-                 ("주가 변동성 σ", tm.sig)]:
+                 ("주가 변동성 σ", tm.sig)]
+                + ([("BDT 단기이자율 변동성 σ", tm.bdt_sig),
+                    ("BDT σ 산출방식", sig_how or "직접 입력 (산출근거 없음)"),
+                    ("BDT 기준 곡선", "위험 곡선에 직접"
+                     if tm.bdt_base == 0 else "무위험 + 확정 스프레드")]
+                   if put_bdt_on(tm) else [])):
         put(C, r, 2, k, bold=True, border=True, fill=RPT["light"])
-        put(C, r, 3, v, border=True, fmt=(R_P2 if k == "주가 변동성 σ" else None),
+        put(C, r, 3, v, border=True,
+            fmt=(R_P2 if k in ("주가 변동성 σ", "BDT 단기이자율 변동성 σ") else None),
             align=None if isinstance(v, str) else "right", wrap=True)
         r += 1
     r += 1
@@ -1970,6 +1983,11 @@ def build_xlsx_rate(tm: Terms):
                "위험중립가중치 q = [exp(f·Δt) − d] ÷ (u − d) 에서 u·d 를 만드는 데만 "
                "쓴다 — q 가 이자율과 주가를 잇는 자리라 여기 함께 적어 둔다.")
     r += 1
+    if put_bdt_on(tm):
+        note(C, r, "BDT 단기이자율 변동성 σ 는 조기상환권을 재는 금리격자에만 쓴다. "
+                   "산출방식 줄이 「직접 입력」이면 근거가 조서에 없다는 뜻이다 — "
+                   "앱 조서 탭의 「금리변동성 산출내역」 리포트를 함께 철하십시오.")
+        r += 1
     note(C, r, "위험 곡선 출처는 앱의 이자율 칸에서 고른 그대로다. 두 등급 보간이면 "
                "아래 입력곡선 시트의 위험 열이 이미 섞인 곡선이고, 등급 하나를 "
                "고르셨으면 고시표의 그 줄이 그대로 들어간다.")
@@ -4892,7 +4910,7 @@ with tabs[9]:
              "감사인이 인풋까지 따라올 수 있습니다. 둘 다 계산이 수식으로 들어갑니다.")
     MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
-    rc1, rc2 = st.columns(2)
+    rc1, rc2, rc3 = st.columns(3)
     with rc1:
         st.markdown("**변동성 산출내역**")
         _peers = st.session_state.get("peers") or []
@@ -4932,10 +4950,41 @@ with tabs[9]:
                      disabled=not (len(t.rf_curve) >= 2 and len(credit_curve(t)) >= 2)):
             try:
                 st.session_state.rep_rate = (
-                    f"이자율_산출내역_{dt.date.today()}.xlsx", build_xlsx_rate(t))
+                    f"이자율_산출내역_{dt.date.today()}.xlsx",
+                    build_xlsx_rate(t, st.session_state.get("rate_how") or ""))
             except Exception as ex:
                 st.error(f"만들지 못했습니다 — {ex}")
         rr_ = st.session_state.get("rep_rate")
         if rr_:
             st.download_button(f"{rr_[0]}  ({len(rr_[1])/1024:,.0f} KB)", rr_[1], rr_[0],
                                MIME, key="dl_rate", use_container_width=True)
+
+    with rc3:
+        st.markdown("**금리변동성 산출내역**")
+        _rser = st.session_state.get("rate_series") or []
+        _rop = st.session_state.get("rate_opt") or {}
+        _rhow = st.session_state.get("rate_how") or ""
+        if not put_bdt_on(t):
+            st.caption("조기상환권을 BDT 로 재지 않으므로 σ 가 값에 들어가지 "
+                       "않습니다. 이 리포트는 필요하지 않습니다.")
+        elif _rser:
+            st.caption(f"금리 {len(_rser)}개로 만듭니다 — {_rhow}")
+        else:
+            st.caption("BDT 의 σ 를 쓰고 있는데 산출근거가 없습니다. 왼쪽 "
+                       "조기상환청구권 칸에서 금리 시계열을 넣으십시오.")
+        if st.button("금리변동성 리포트 만들기", use_container_width=True,
+                     disabled=not _rser):
+            try:
+                st.session_state.rep_rvol = (
+                    f"금리변동성_산출내역_{dt.date.today()}.xlsx",
+                    build_xlsx_vol([("기준 금리 시계열", _rser)],
+                                   tdays=_rop.get("tdays", 250),
+                                   drop=_rop.get("drop", True),
+                                   applied=t.bdt_sig, kind="rate", how=_rhow,
+                                   asof=dt.date.fromisoformat(t.d_base)))
+            except Exception as ex:
+                st.error(f"만들지 못했습니다 — {ex}")
+        rq_ = st.session_state.get("rep_rvol")
+        if rq_:
+            st.download_button(f"{rq_[0]}  ({len(rq_[1])/1024:,.0f} KB)", rq_[1], rq_[0],
+                               MIME, key="dl_rvol", use_container_width=True)
