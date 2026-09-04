@@ -3871,10 +3871,22 @@ with st.sidebar:
             st.markdown("**시계열로 σ 산출**")
             st.caption("할인율은 이미 등급보간 → 만기보간을 거칩니다. 변동성도 같은 "
                        "자료·같은 보간에서 나와야 조서가 하나로 이어집니다.")
-            _rmode = st.radio("자료", ["single", "blend"], horizontal=True,
-                              key="rvmode",
-                              format_func=lambda x: "단일 시계열" if x == "single"
-                              else "등급 보간")
+            # 위험 곡선에서 고른 방식을 그대로 첫 값으로 둔다. 사용자가 여기서
+            # 따로 고르면 그 선택이 남는다 (위젯 키가 있으므로 한 번만 정한다).
+            if "rvmode" not in st.session_state:
+                st.session_state.rvmode = {"pick": "pick", "rating": "blend"}.get(
+                    t.rate_mode, "single")
+            # 위험 곡선과 같은 세 갈래다. 이름도 같게 두어야 조서에서 「어느
+            # 등급 시계열을 썼나」가 곡선 쪽과 한눈에 대조된다.
+            _RVM = ["pick", "single", "blend"]
+            _RVNM = {"pick": "표에서 등급 하나 고르기",
+                     "single": "일자 · 금리 두 열 파일",
+                     "blend": "두 등급 곡선으로 보간"}
+            _rmode = st.radio("자료", _RVM, key="rvmode",
+                              format_func=lambda x: _RVNM[x],
+                              help="위험 곡선을 **표에서 등급 하나**로 고르셨으면 "
+                                   "여기도 같은 등급을 고르십시오. 곡선과 변동성이 "
+                                   "다른 등급에서 나오면 조서가 갈라집니다.")
             _rt = int(st.number_input("연 거래일수", value=250, step=5,
                                       min_value=30, key="rvtd"))
             _rdrop = st.checkbox("이상치 제거 (MAD 2.5배)", value=True, key="rvdrop")
@@ -3917,38 +3929,62 @@ with st.sidebar:
                         f" ({'·'.join(f'{x:g}년' for x in _tens.get(r, []))})"
                         if _tens.get(r) else "")
                     st.success("찾은 등급 — " + " · ".join(_nm(r) for r in _opt))
-                    g1, g2 = st.columns(2)
-                    _ia = _opt.index(t.rt_a) if t.rt_a in _opt else 0
-                    _ra = g1.selectbox("곡선 A", _opt, index=_ia,
-                                       format_func=_nm, key="rvga")
-                    _rest = [x for x in _opt if x != _ra]
-                    _ib = (_rest.index(t.rt_b) + 1) if t.rt_b in _rest else 0
-                    _rb = g2.selectbox("곡선 B", [None] + _rest, index=_ib,
-                                       format_func=lambda r: "(없음)" if r is None
-                                       else _nm(r), key="rvgb")
-                    _rtg = st.selectbox(
-                        "평가대상", RATINGS, key="rvgt",
-                        index=RATINGS.index(t.rt_tgt) if t.rt_tgt in RATINGS else 8,
-                        help="두 곡선 사이면 내삽, 밖이면 같은 기울기로 외삽합니다.")
-                    if _rb is None or _ra is None:
-                        _ser = _pool[_ra]
-                        _how = f"{_nm(_ra)} 단일 · 고정만기 {t.T:.2f}년"
-                        st.info("곡선이 하나뿐이라 등급 보간 없이 그대로 씁니다.")
+                    if _rmode == "pick":
+                        # 표의 한 등급을 그대로 쓴다. 보간이 없으니 조서에
+                        # 적을 것도 「그 등급 · 고정만기」 한 줄뿐이다.
+                        _dg = t.rt_tgt if t.rt_tgt in _opt else _opt[0]
+                        _rp = st.selectbox("σ 를 뽑을 등급", _opt,
+                                           index=_opt.index(_dg),
+                                           format_func=_nm, key="rvgp")
+                        _ser = _pool[_rp]
+                        _how = f"{_nm(_rp)} 단일 · 고정만기 {t.T:.2f}년"
+                        if t.rt_tgt and _rp and _rp != t.rt_tgt:
+                            st.warning(f"위험 곡선의 평가대상은 **{t.rt_tgt}** 인데 "
+                                       f"σ 는 **{_rp}** 에서 뽑고 있습니다. 등급이 "
+                                       "다르면 조서에 그 이유를 적으십시오 — 인접 "
+                                       "등급끼리는 변동성이 거의 같아 실무에서 "
+                                       "흔히 하는 대체이지만, 근거는 남아야 합니다.")
                     else:
-                        _ser = blend_series(_pool[_ra], _pool[_rb], _ra, _rb, _rtg)
-                        _ja, _jb = rating_idx(_ra), rating_idx(_rb)
-                        _w = ((rating_idx(_rtg)-_ja)/(_jb-_ja)) if _ja != _jb else 0.0
-                        _how = (f"{_ra}·{_rb} → {_rtg} (가중치 {_w:.2f}) · "
-                                f"고정만기 {t.T:.2f}년")
-                        st.caption(f"가중치 — {_ra} {1-_w:.0%} · {_rb} {_w:.0%}")
-                        if not 0 <= _w <= 1:
-                            st.warning(
-                                f"평가대상 **{_rtg}** 가 두 곡선 **밖**입니다 "
-                                f"(가중치 {_w:.2f}). 등급 간 스프레드는 아래로 "
-                                "갈수록 가속해서 벌어지므로, 직선으로 뻗는 외삽은 "
-                                "금리를 낮게 잡습니다. 평가대상을 사이에 끼우는 "
-                                "등급을 받아 오시는 편이 낫습니다.")
-                    _tn = _tens.get(_ra) or []
+                        g1, g2 = st.columns(2)
+                        _ia = _opt.index(t.rt_a) if t.rt_a in _opt else 0
+                        _ra = g1.selectbox("곡선 A", _opt, index=_ia,
+                                           format_func=_nm, key="rvga")
+                        _rest = [x for x in _opt if x != _ra]
+                        _ib = (_rest.index(t.rt_b) + 1) if t.rt_b in _rest else 0
+                        _rb = g2.selectbox("곡선 B", [None] + _rest, index=_ib,
+                                           format_func=lambda r: "(없음)" if r is None
+                                           else _nm(r), key="rvgb")
+                        _rtg = st.selectbox(
+                            "평가대상", RATINGS, key="rvgt",
+                            index=(RATINGS.index(t.rt_tgt)
+                                   if t.rt_tgt in RATINGS else 8),
+                            help="두 곡선 사이면 내삽, 밖이면 같은 기울기로 외삽합니다.")
+                        if _rb is None or _ra is None:
+                            _ser = _pool[_ra]
+                            _how = f"{_nm(_ra)} 단일 · 고정만기 {t.T:.2f}년"
+                            st.info("곡선 B 가 없어 보간 없이 **곡선 A** 를 "
+                                    "그대로 씁니다. 처음부터 등급 하나만 쓰실 "
+                                    "거라면 위에서 **표에서 등급 하나 고르기** 를 "
+                                    "고르시는 편이 짧습니다.")
+                        else:
+                            _ser = blend_series(_pool[_ra], _pool[_rb],
+                                                _ra, _rb, _rtg)
+                            _ja, _jb = rating_idx(_ra), rating_idx(_rb)
+                            _w = (((rating_idx(_rtg)-_ja)/(_jb-_ja))
+                                  if _ja != _jb else 0.0)
+                            _how = (f"{_ra}·{_rb} → {_rtg} (가중치 {_w:.2f}) · "
+                                    f"고정만기 {t.T:.2f}년")
+                            st.caption(f"가중치 — {_ra} {1-_w:.0%} · "
+                                       f"{_rb} {_w:.0%}")
+                            if not 0 <= _w <= 1:
+                                st.warning(
+                                    f"평가대상 **{_rtg}** 가 두 곡선 **밖**입니다 "
+                                    f"(가중치 {_w:.2f}). 등급 간 스프레드는 아래로 "
+                                    "갈수록 가속해서 벌어지므로, 직선으로 뻗는 "
+                                    "외삽은 금리를 낮게 잡습니다. 평가대상을 "
+                                    "사이에 끼우는 등급을 받아 오시는 편이 "
+                                    "낫습니다.")
+                    _tn = _tens.get(_rp if _rmode == "pick" else _ra) or []
                     if len(_tn) == 1 and abs(_tn[0] - t.T) > 0.5:
                         st.warning(f"파일의 만기가 **{_tn[0]:g}년** 한 열뿐인데 "
                                    f"잔존만기는 **{t.T:.2f}년** 입니다. 만기 보간을 "
