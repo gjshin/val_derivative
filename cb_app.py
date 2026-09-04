@@ -57,6 +57,7 @@ class Terms:
     p_lost_int: int = 0           # 조기상환 행사금액이 상실이자 보상 수준인가
     fvpl_whole: int = 0           # 복합계약 전체를 당기손익-공정가치로 지정했는가
     k_method: int = 0
+    p_sep: int = 1                  # 조기상환권 1 분리 / 0 주계약에 포함
     k_sep: int = 1                  # 1 별도 금융상품 / 0 복합내재파생에 포함            # 0 유무가치비교 / 1 혼합할인율 / 2 지분·부채 분리
     sig: float = 0.4130
     model: str = "TF"
@@ -363,12 +364,24 @@ def engine(tm: Terms, conv=True, put=True, call=False, conv_start=None):
     conv_ok = lambda i: conv and st_lo(cs) <= i <= st_hi(tm.cv_e)
     exact = (tm.rfx_mode > 0 and tm.carry == 0)
 
+    # 도달확률. 위험중립가중치 q 가 구간마다 다르므로 이항계수 한 방에 셀 수
+    # 없다. COMBIN(i,j)·q^j·(1−q)^(i−j) 는 q 가 모든 구간에서 같을 때만 맞고,
+    # 그러면 정규화된 이월 가중치에서 q 가 통째로 약분돼 「확률가중」이 아니라
+    # 「경로 수 가중」이 된다. 앞에서부터 한 칸씩 쌓아야 한다.
+    #     P(i,j) = P(i−1,j−1)·q(i−1) + P(i−1,j)·(1−q(i−1))
+    # 평탄한 곡선이면 이항식과 정확히 같은 값이 나온다 (책 예제가 그렇다).
+    Preach = [[1.0]]
+    for i in range(1, n+1):
+        q_ = qi(i-1)
+        Preach.append([(Preach[i-1][j-1]*q_ if j-1 >= 0 else 0.0)
+                       + (Preach[i-1][j]*(1-q_) if j <= i-1 else 0.0)
+                       for j in range(i+1)])
+
     Kg = None
     if not exact:
         Kg = [[tm.K0]]
         for i in range(1, n+1):
             q = qi(i-1)
-            P = lambda a, b: math.comb(a, b) * q**b * (1-q)**(a-b)
             row = []
             for j in range(i+1):
                 if tm.rfx_mode == 0:
@@ -383,8 +396,8 @@ def engine(tm: Terms, conv=True, put=True, call=False, conv_start=None):
                 if tm.carry == 3: row.append(dn)
                 elif tm.carry == 2: row.append(up*q + dn*(1-q))
                 else:
-                    wu, wd = P(i-1, j-1)*q, P(i-1, j)*(1-q)
-                    row.append((up*wu + dn*wd)/(wu+wd))
+                    wu, wd = Preach[i-1][j-1]*q, Preach[i-1][j]*(1-q)
+                    row.append((up*wu + dn*wd)/(wu+wd) if wu+wd > 0 else dn)
             Kg.append(row)
 
     memo = {}
@@ -872,6 +885,17 @@ def split_test(tm: Terms, full, b0, b1, b2, ca, rows_eir):
     # 화면에서 고른 회계 처리와 판정이 어긋나면 알린다
     want = 1 if out["call"]["결론"] == "별도의 금융상품" else 0
     out["call"]["설정일치"] = (not out["call"]["있음"]) or (tm.k_sep == want)
+    # 조기상환권도 같다. 다만 스위치가 살아 있을 때만 본다 — 매도청구권을
+    # 내재파생으로 묶거나 전환권이 부채면 조기상환권은 묶음에 딸려 분리된다.
+    _live = tm.conv_class == "equity" and tm.k_sep != 0
+    _res = out["put"]["결론"]
+    if not out["put"]["있음"] or not _live or _res == "분리하지 않을 여지":
+        # 「여지」는 어느 쪽으로도 갈 수 있다. 어긋났다고 하지 않는다.
+        out["put"]["설정일치"] = True
+    else:
+        out["put"]["설정일치"] = (int(tm.p_sep) ==
+                                (1 if _res in ("분리", "묶어서 분리") else 0))
+    out["put"]["스위치"] = _live
     return out
 
 
@@ -905,6 +929,11 @@ def allocate(tm: Terms, full, b0, b1, b2, ca):
     다를 뿐이다.
     """
     sep = tm.k_sep != 0
+    # 조기상환권을 분리하지 않는 선택은 **전환권이 자본이고 매도청구권이 별도
+    # 금융상품일 때**만 살아 있다. 매도청구권을 내재파생으로 묶으면 문단 B4.3.4
+    # 가 복수의 내재파생을 하나의 복합내재파생으로 다루라고 하므로 조기상환권도
+    # 그 묶음에 딸려 분리된다. 전환권이 부채면 애초에 묶음으로 재므로 마찬가지다.
+    psep = not (tm.conv_class == "equity" and sep and int(tm.p_sep) == 0)
     if tm.conv_class == "liability":
         # 전환권이 파생상품부채 — 내재파생을 공정가치로 두고 주계약을 잔여로.
         # 전환권과 조기상환권은 상호의존적이라 하나의 복합내재파생상품으로 묶어
@@ -924,6 +953,18 @@ def allocate(tm: Terms, full, b0, b1, b2, ca):
                    "매도청구권은 발행회사만 행사할 수 있어 거래상대방이 그대로이므로 "
                    "내재파생상품이고, 같은 묶음에 넣어 순액으로 측정합니다 (문단 4.3.1).")
                 + f" 이론적 주계약가치는 {b0:,.2f} 입니다.")
+    elif not psep:
+        # 조기상환권이 주계약과 밀접하게 관련되어 분리하지 않는다. 부채요소를
+        # 통째로 상각후원가로 두고, 파생상품부채를 세우지 않는다.
+        rows = [("부채요소 (사채 + 조기상환권)", b1),
+                ("매도청구권 · 파생상품자산", -ca),
+                ("전환권대가 · 자본", 100-b1+ca)]
+        note = ("기업회계기준서 제1032호 문단 31 — 부채요소를 먼저 정하고 나머지를 자본에 "
+                "배분합니다. 최초 인식에는 손익이 생기지 않습니다. "
+                "조기상환청구권은 주계약과 밀접하게 관련되어 분리하지 않으므로 "
+                "(제1109호 문단 4.3.3·B4.3.5(5)(가)) 부채요소에 포함해 상각후원가로 "
+                f"측정합니다. 분리했다면 파생상품부채로 세웠을 금액은 {b1-b0:,.2f} "
+                "입니다 — 분리하지 않으므로 인식하지 않고, 유효이자율에 녹아 듭니다.")
     else:
         rows = [("주계약 (옵션 없는 사채)", b0),
                 ("조기상환청구권 · 파생상품부채", (b1-b0) if sep else (b1-b0-ca))]
@@ -2154,6 +2195,9 @@ def build_xlsx(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     N2, N0, P2, N4, N6 = '#,##0.00', '#,##0', '0.00%', '0.0000', '0.000000'
     DATE = 'yyyy-mm-dd'
     n = tm.n; dt_ = tm.T/n; mper = n/(tm.T*12); R0 = 20
+    # 조기상환권을 분리하지 않는 선택이 실제로 살아 있는가. allocate 와 같은
+    # 조건이어야 가정 시트·회계처리 표가 배분표와 어긋나지 않는다.
+    _nosep = (tm.conv_class == "equity" and tm.k_sep != 0 and int(tm.p_sep) == 0)
     # 계약상 개월 → 평가기준일 기준 스텝. 엔진과 같아야 한다 (경과분을 뺀다).
     stp_lo, stp_hi = step_mapper(tm, n, dt_)
     per_ = lambda mth: max(1, int(round(mth*mper)))   # 주기는 뺄 것이 없다
@@ -2278,6 +2322,9 @@ def build_xlsx(tm: Terms, full, b0, b1, b2, ca, conv, eir):
       ("4. 옵션", [("전환 시작 / 종료 (개월)", tm.cv_s, N0), ("　", tm.cv_e, N0),
         ("조기상환 시작 / 종료 / 주기", tm.p_s, N0), ("　", tm.p_e, N0), ("　 ", tm.p_f, N0),
         ("조기상환 행사금액 산정", "보장수익률 복리" if tm.p_mode == "accrue" else "고정률", None),
+        ("조기상환권 회계 처리",
+         ("분리하지 않음 · 부채요소에 포함" if _nosep else "분리 · 파생상품부채"),
+         None),
         ("매도청구 시작 / 종료 / 주기", tm.k_s, N0), ("　  ", tm.k_e, N0), ("　   ", tm.k_f, N0),
         ("매도청구 프리미엄", tm.k_prem, P2),
         ("매도청구 복리 횟수 (연)", tm.k_cmp, N0), ("매도청구 한도", tm.k_w, P2),
@@ -2652,7 +2699,9 @@ def build_xlsx(tm: Terms, full, b0, b1, b2, ca, conv, eir):
                             else f"{_v:,.4f}")), border=True); _r += 1
         _r += 1
     put(J, _r, 2, "이 시트는 앱의 「분리 판단」 화면과 같은 함수가 만든다. 계약 조항 "
-                  "확인 항목을 바꾸면 결론과 문안이 함께 바뀐다.", color=GREY, size=9)
+                  "확인 항목을 **앱에서** 바꾸면 결론과 문안이 함께 바뀐다. "
+                  "이 시트는 그 결과를 옮겨 적은 것이라 수식이 없다.",
+        color=GREY, size=9)
     for _row in J.iter_rows(min_row=5, max_row=_r, min_col=3, max_col=3):
         for _c in _row: _c.alignment = Alignment(wrap_text=True, vertical="top")
 
@@ -2722,6 +2771,9 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     N2, N0, P2, N4, N6 = '#,##0.00', '#,##0', '0.00%', '0.0000', '0.000000'
     DATE = 'yyyy-mm-dd'
     n = tm.n; dt_ = tm.T/n; mper = n/(tm.T*12); R0 = 20
+    # 조기상환권을 분리하지 않는 선택이 실제로 살아 있는가. allocate 와 같은
+    # 조건이어야 가정 시트·회계처리 표가 배분표와 어긋나지 않는다.
+    _nosep = (tm.conv_class == "equity" and tm.k_sep != 0 and int(tm.p_sep) == 0)
     el = tm.elapsed_m
     # 트랜치 이름은 계약의 매도청구 한도에서 나온다. 30/70 으로 굳혀 두면
     # 한도가 다른 사채에서 시트 이름이 계약과 어긋난다.
@@ -2804,7 +2856,8 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         ("매도청구 프리미엄", "prem", tm.k_prem, P2, True),
         ("매도청구 복리 횟수 (연)", "kcmp", tm.k_cmp, N0, True),
         ("매도청구 한도", "cw", tm.k_w, P2, True),
-        (f"{KW} 전환 시작 (스텝)", "cv30", stp_lo(max(tm.cv_s, tm.k_lock)), N0, True),
+        (f"{KW} 전환 시작 (스텝)", "cv30", stp_lo(max(tm.cv_s, tm.k_lock)), N0,
+         tm.k_method == 0),
         ("변동성 σ", "sig", tm.sig, P2, True),
         ("상승계수 u", "u", "@=EXP(C{sig}*SQRT(C{dt}))", N4, False),
         ("하락계수 d", "dd", "@=1/C{u}", N4, False),
@@ -2815,12 +2868,13 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         ("조정일 처리 (1/2/3)", "mth", max(1, tm.carry), N0, True),
         ("전환권 분류 (1 자본 / 0 부채)", "eqcls", 1 if tm.conv_class == "equity" else 0, N0, True),
         ("매도청구권 평가방법 (0 유무가치 / 1 혼합할인율 / 2 지분·부채 분리)",
-         "kmeth", tm.k_method, N0, True),
+         "kmeth", tm.k_method, N0, False),
+        ("조기상환권 처리 (1 분리 / 0 부채요소에 포함)", "psep", int(tm.p_sep), N0, True),
         ("매도청구권 처리 (1 별도 금융상품 / 0 내재파생 포함)", "ksep", tm.k_sep, N0, True),
-        ("신용위험 처리 (0 TF / 1 GS)", "mdl", 1 if tm.model == "GS" else 0, N0, True),
-        ("조기상환권 (0 금리고정 / 1 BDT)", "pbdt", 1 if put_bdt_on(tm) else 0, N0, True),
+        ("신용위험 처리 (0 TF / 1 GS)", "mdl", 1 if tm.model == "GS" else 0, N0, False),
+        ("조기상환권 (0 금리고정 / 1 BDT)", "pbdt", 1 if put_bdt_on(tm) else 0, N0, False),
         ("BDT 변동성 σ", "bsig", tm.bdt_sig, P2, True),
-        ("BDT 기준 (0 위험곡선 / 1 무위험+스프레드)", "bbase", tm.bdt_base, N0, True),
+        ("BDT 기준 (0 위험곡선 / 1 무위험+스프레드)", "bbase", tm.bdt_base, N0, False),
         ("전자등록총액 (원)", "face", tm.face_total, N0, True),
         ("무위험 (연속, 평탄)", "rfc", RF(tm.T), P2, False)]
     ROWN = {key: 3+i for i, (_, key, _, _, _) in enumerate(spec)}
@@ -2836,6 +2890,18 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         "행사금액은 발행일부터 붙는다.", color=GREY, size=9)
     put(A, nb+1, 2, "선도이자율은 부트스트래핑 결과라 각 트리 시트 11·12행에 값으로 들어 있다.",
         color=AMB, size=9)
+    # 흰 셀 가운데 「방법을 고르는」 것들은 트리 구조 자체를 정하므로 엑셀에서
+    # 바꿔도 따라오지 않는다. 그 사실을 여기서 못박아 둔다.
+    put(A, nb+2, 2, "흰 셀 가운데 평가방법·신용위험 처리·BDT 관련 줄은 "
+        "**앱에서 고른 값**이다. 이 조서에는 고른 방법의 트리만 들어 있어서 "
+        "여기서 숫자를 바꿔도 트리가 따라오지 않는다. 방법을 바꾸려면 앱에서 "
+        "바꾸고 조서를 다시 만들어야 한다.", color=RED, size=9)
+    if put_bdt_on(tm):
+        put(A, nb+3, 2, "BDT 변동성 σ 도 마찬가지다. BDT 격자의 기준금리 a 는 "
+            "「σ 가 지금 값일 때 시장 금리곡선을 맞추도록」 역산한 값이라 조서에 "
+            "숫자로 박혀 있다. 여기서 σ 만 바꾸면 격자는 움직이는데 a 는 그대로라 "
+            "시장 곡선과 어긋난다 — 「BDT 단기이자율」 시트의 캘리브레이션 검산이 "
+            "그때 틀어진다. σ 를 바꾸려면 앱에서 바꾸십시오.", color=RED, size=9)
 
     HEAD = ["Date", "time-step", "Flag(전환)", "Flag(조기상환)", "Flag(매도청구)",
             "Flag(리픽싱)", "조기상환금액", "매도청구금액", "쿠폰", "만기상환",
@@ -2930,10 +2996,12 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     # ── 도달확률 ──
     W2 = wb.create_sheet("도달확률"); W2.sheet_view.showGridLines = False
     W2.column_dimensions["B"].width = 12
-    title(W2, 2, "도달확률  P = COMBIN(스텝, r) × q^(스텝−r) × (1−q)^r", span=min(n+1, 12))
-    put(W2, 3, 2, "q 는 그 열의 위험중립가중치다 (① 16행). 이월 계산에서 직전 열을 "
-        "참조하므로 열마다 제 q 를 써야 엔진과 맞는다. "
-        "스텝(4행)과 하락 횟수(B열)를 참조하므로 머리를 고치면 표 전체가 따라 움직인다.",
+    title(W2, 2, "도달확률  P(i,r) = P(i−1,r)×q + P(i−1,r−1)×(1−q)",
+          span=min(n+1, 12))
+    put(W2, 3, 2, "앞 열에서 한 칸씩 쌓아 온다. q 는 **직전 열**의 위험중립가중치이고 "
+        "(① 16행), 이 격자는 구간마다 q 가 다르므로 이항계수 한 방으로 셀 수 없다 — "
+        "COMBIN(i,r)×q^(i−r)×(1−q)^r 는 q 가 모든 구간에서 같을 때만 맞는다. "
+        "r 은 하락 횟수이고, 위로 가면 r 이 그대로(q), 아래로 가면 r 이 하나 는다(1−q).",
         color=GREY, size=9)
     put(W2, 4, 2, "r ＼ 스텝", bold=True, size=8, fill=LIGHT, border=True, align="center")
     for i in range(n+1):
@@ -2946,12 +3014,18 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         put(W2, 5+r, 2, (0 if r == 0 else f"=$B{4+r}+1"),
             bold=True, size=8, fmt=N0, align="center", fill=LIGHT, border=True)
         for i in range(r, n+1):
-            L = gl(3+i)
-            qq = f"{Q(S1)}!{L}$16"
-            # 스텝은 이 열의 4행, 하락 횟수는 이 행의 B열에서 읽는다.
-            put(W2, 5+r, 3+i,
-                f"=COMBIN({L}$4,$B{5+r})*{qq}^({L}$4-$B{5+r})*(1-{qq})^$B{5+r}",
-                fmt='0.000000', size=8, align="right")
+            L, Lp = gl(3+i), gl(2+i)
+            # q 는 직전 열의 것이다 — 열 i−1 의 q 가 구간 [i−1, i] 를 지배한다.
+            qq = f"{Q(S1)}!{Lp}$16"
+            if i == 0:
+                v = 1
+            elif r == 0:
+                v = f"={Lp}5*{qq}"                       # 계속 상승뿐
+            else:
+                # 위 칸은 상승(r 유지), 그 위 칸은 하락(r 하나 증가)으로 온다.
+                # r = i 면 {Lp}{5+r} 이 비어 있어 0 으로 읽힌다 — 그게 맞다.
+                v = f"={Lp}{5+r}*{qq}+{Lp}{5+r-1}*(1-{qq})"
+            put(W2, 5+r, 3+i, v, fmt='0.000000', size=8, align="right")
     W2.freeze_panes = "C5"
 
     # ── 02 전환가격 ──
@@ -3465,12 +3539,22 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         put(R, r, 3, fx, bold=True, fmt=N2, align="right", border=True)
         put(R, r, 4, f'=IF(ISNUMBER(C{r}),C{r}/100*{K["face"]},"")',
             fmt=N0, align="right", border=True)
+    # 마팅게일 검산식. SUMPRODUCT 로 마지막 열의 도달확률 × 주가를 모두 더한 뒤
+    # 구간 선도이자율의 누적으로 할인하고 S0 으로 나눈다. 1 이 나와야 한다.
+    _LN = gl(3+n)
+    _GRW = "*".join(f"EXP({Q(S1)}!{gl(3+i)}$11*{K['dt']})"
+                    for i in range(n)) or "1"
+    _MG = (f"=SUMPRODUCT(도달확률!{_LN}5:{_LN}{5+n},"
+           f"'01 주가'!{_LN}{R0}:{_LN}{R0+n})/({_GRW})/{K['S0']}")
     sec(R, 27, "3. 검산", span=5)
     for i, (nm, fx, jd) in enumerate([
             ("위험중립가중치 q", f"={K['q']}", '=IF(AND(C28>0,C28<1),"적합","확인 필요")'),
-            ("도달확률 합계 (마지막 열)",
-             f"=SUM(도달확률!{gl(3+n)}5:{gl(3+n)}{5+n})",
-             '=IF(ABS(C29-1)<0.0001,"적합","확인 필요")'),
+            # 합계 = 1 은 재귀식이든 이항식이든 자동으로 성립해서 틀려도 통과한다.
+            # 대신 마팅게일을 본다 — 마지막 열의 도달확률로 잰 주가 기댓값을
+            # 무위험으로 할인하면 평가기준일 주가가 나와야 한다. q·u·d·선도
+            # 이자율·도달확률이 하나라도 어긋나면 이 값이 틀어진다.
+            ("주가 마팅게일 (기댓값 ÷ 성장) ÷ S0", _MG,
+             '=IF(ABS(C29-1)<0.000001,"적합","확인 필요")'),
             ("전체 ≥ 주계약", "=C10-C16", '=IF(C30>=0,"적합","확인 필요")'),
             ("배분 합계 = 100",
              f'=IF({K["ksep"]}=1,IF({K["eqcls"]}=1,C16+C18-C22+C23,C25+C24-C22),'
@@ -3545,7 +3629,9 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     sec(M, 5, "유효이자율 역산", span=6)
     for i, (k, fx, fm, val) in enumerate([
             # 부채로 분류하면 잔여로 떨어진 금액이 인식액이다. 이론값(C16)이 아니다.
-            ("주계약 (인식액)", f'=IF({K["eqcls"]}=1,결과!C16,결과!C25)', N2, None),
+            ("주계약 (인식액)",
+             f'=IF({K["eqcls"]}=1,IF(AND({K["ksep"]}=1,{K["psep"]}=0),결과!C17,'
+             f'결과!C16),결과!C25)', N2, None),
             ("만기상환금액", f"={K['red']}", N2, None),
             ("표면이자 (회당)", f"=100*{K['cpn']}*{K['ipaym']}/12", N2, None),
             ("상각 횟수", None, N0, nper)]):
@@ -3611,35 +3697,48 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     # 매도청구권을 별도 금융상품으로 볼지 내재파생에 넣을지에 따라 표가 갈린다.
     # 넣는 쪽이면 파생 줄에서 콜을 빼고 자산 줄을 비운다. 합계는 어느 쪽이든 100.
     KS = K["ksep"]
-    al2 = [("주계약", f'=IF({K["eqcls"]}=1,결과!C16,결과!C25)'),
-           ("조기상환청구권 · 파생상품부채",
-            f'=IF({K["eqcls"]}=0,"",IF({KS}=1,결과!C18,결과!C18-결과!C22))'),
-           ("복합내재파생상품 · 파생상품부채",
-            f'=IF({K["eqcls"]}=1,"",IF({KS}=1,결과!C24,결과!C24-결과!C22))'),
-           ("매도청구권 · 파생상품자산", f'=IF({KS}=1,-결과!C22,"")'),
-           ("전환권대가 · 자본", f'=IF({K["eqcls"]}=1,결과!C23,"")')]
+    # 조기상환권을 분리하지 않는 갈래. 전환권이 자본이고 매도청구권이 별도
+    # 금융상품일 때만 살아 있다 — 매도청구권을 내재파생으로 묶으면 문단
+    # B4.3.4 가 하나의 복합내재파생으로 다루라고 해서 조기상환권도 딸려 간다.
+    NS = f'AND({K["eqcls"]}=1,{KS}=1,{K["psep"]}=0)'
+    _HOST = f'=IF({K["eqcls"]}=1,IF({NS},"",결과!C16),결과!C25)'
+    _PUT = f'=IF(OR({K["eqcls"]}=0,{KS}=0,{NS}),"",결과!C18)'
+    _LIAB = f'=IF({NS},결과!C17,"")'
+    # 전환권이 부채면 전환권+조기상환권 묶음, 자본이면서 콜을 내재파생으로
+    # 넣었으면 조기상환권+매도청구권 묶음이다. 어느 쪽이든 순액 한 줄이다.
+    _CMP = (f'=IF({K["eqcls"]}=0,IF({KS}=1,결과!C24,결과!C24-결과!C22),'
+            f'IF({KS}=0,결과!C18-결과!C22,""))')
+    _CALL = f'=IF({KS}=1,-결과!C22,"")'
+    _EQ = f'=IF({K["eqcls"]}=1,결과!C23,"")'
+    al2 = [("주계약", _HOST),
+           ("부채요소 (사채 + 조기상환권)", _LIAB),
+           ("조기상환청구권 · 파생상품부채", _PUT),
+           ("복합내재파생상품 · 파생상품부채", _CMP),
+           ("매도청구권 · 파생상품자산", _CALL),
+           ("전환권대가 · 자본", _EQ)]
     for i, (nm, fx) in enumerate(al2):
         r = 7+i
         put(E, r, 2, nm, border=True)
         put(E, r, 3, fx, fmt=N2, align="right", border=True)
         put(E, r, 4, f'=IF(ISNUMBER(C{r}),C{r}/100*{K["face"]},"")',
             fmt=N0, align="right", border=True)
-    put(E, 12, 2, "합계", bold=True, fill=BAND, border=True)
-    put(E, 12, 3, "=SUM(C7:C11)", bold=True, fill=BAND, fmt=N2, align="right", border=True)
-    put(E, 12, 4, "=SUM(D7:D11)", bold=True, fill=BAND, fmt=N0, align="right", border=True)
-    sec(E, 14, "2. 분개", span=5)
+    put(E, 13, 2, "합계", bold=True, fill=BAND, border=True)
+    put(E, 13, 3, "=SUM(C7:C12)", bold=True, fill=BAND, fmt=N2, align="right", border=True)
+    put(E, 13, 4, "=SUM(D7:D12)", bold=True, fill=BAND, fmt=N0, align="right", border=True)
+    put(E, 14, 2, "주계약과 부채요소는 서로 배타적이다 — 조기상환권을 분리하면 위 줄이, "
+        "분리하지 않으면 아래 줄이 찬다.", color=GREY, size=9)
+    sec(E, 16, "2. 분개", span=5)
     for i, h in enumerate(["계정", "차변 (100)", "대변 (100)", "차변 (원)", "대변 (원)"]):
-        put(E, 15, 2+i, h, bold=True, fill=LIGHT, align="center", border=True, size=9)
+        put(E, 17, 2+i, h, bold=True, fill=LIGHT, align="center", border=True, size=9)
     je2 = [("현금", "=100", None),
            ("파생상품자산 (매도청구권)", f'=IF({KS}=1,결과!C22,"")', None),
-           ("　전환사채 (주계약)", None, f'=IF({K["eqcls"]}=1,결과!C16,결과!C25)'),
-           ("　파생상품부채 (조기상환청구권)", None,
-            f'=IF({K["eqcls"]}=0,"",IF({KS}=1,결과!C18,결과!C18-결과!C22))'),
-           ("　파생상품부채 (복합내재파생상품)", None,
-            f'=IF({K["eqcls"]}=1,"",IF({KS}=1,결과!C24,결과!C24-결과!C22))'),
-           ("　전환권대가 (자본)", None, f'=IF({K["eqcls"]}=1,결과!C23,"")')]
+           ("　전환사채 (주계약)", None, _HOST),
+           ("　전환사채 (부채요소)", None, _LIAB),
+           ("　파생상품부채 (조기상환청구권)", None, _PUT),
+           ("　파생상품부채 (복합내재파생상품)", None, _CMP),
+           ("　전환권대가 (자본)", None, _EQ)]
     for i, (nm, dr, cr) in enumerate(je2):
-        r = 16+i
+        r = 18+i
         put(E, r, 2, nm, size=9, border=True)
         put(E, r, 3, dr if dr else "", fmt=N2, align="right", border=True)
         put(E, r, 4, cr if cr else "", fmt=N2, align="right", border=True)
@@ -3647,13 +3746,13 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
             fmt=N0, align="right", border=True)
         put(E, r, 6, f'=IF(ISNUMBER(D{r}),D{r}/100*{K["face"]},"")',
             fmt=N0, align="right", border=True)
-    put(E, 22, 2, "합계", bold=True, fill=BAND, border=True)
+    put(E, 25, 2, "합계", bold=True, fill=BAND, border=True)
     for j2, col in enumerate("CDEF"):
-        put(E, 22, 3+j2, f"=SUM({col}16:{col}21)", bold=True, fill=BAND,
+        put(E, 25, 3+j2, f"=SUM({col}18:{col}24)", bold=True, fill=BAND,
             fmt=(N2 if j2 < 2 else N0), align="right", border=True)
-    put(E, 23, 2, "차변과 대변이 일치해야 한다", bold=True, border=True)
-    put(E, 23, 3, '=IF(ABS(C22-D22)<0.01,"적합","오류")', align="center", border=True)
-    put(E, 25, 2, "최초 인식에는 어떠한 손익도 생기지 않는다.", color=GREY, size=9)
+    put(E, 26, 2, "차변과 대변이 일치해야 한다", bold=True, border=True)
+    put(E, 26, 3, '=IF(ABS(C25-D25)<0.01,"적합","오류")', align="center", border=True)
+    put(E, 28, 2, "최초 인식에는 어떠한 손익도 생기지 않는다.", color=GREY, size=9)
 
     # ── 분리 판단 ──
     # 화면과 같은 함수가 만든 문안이라 둘이 어긋날 수 없다.
@@ -3685,7 +3784,9 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
                             else f"{_v:,.4f}")), border=True); _r += 1
         _r += 1
     put(J, _r, 2, "이 시트는 앱의 「분리 판단」 화면과 같은 함수가 만든다. 계약 조항 "
-                  "확인 항목을 바꾸면 결론과 문안이 함께 바뀐다.", color=GREY, size=9)
+                  "확인 항목을 **앱에서** 바꾸면 결론과 문안이 함께 바뀐다. "
+                  "이 시트는 그 결과를 옮겨 적은 것이라 수식이 없다.",
+        color=GREY, size=9)
     for _row in J.iter_rows(min_row=5, max_row=_r, min_col=3, max_col=3):
         for _c in _row: _c.alignment = Alignment(wrap_text=True, vertical="top")
 
@@ -3704,10 +3805,16 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
                      "결과 시트 3번 검산 마지막 줄에 앱 계산값과의 차이가 나온다."),
       ("", ""),
       ("시트 순서", ""),
-      ("흐름", f"가정 → 01 주가 → 02 전환가격 → … → 09 의사결정 → 10 주계약 → "
-              f"11~14 GS → {S15} → 16 부채요소 → 17~20 매도청구권 방법1 → "
-              "21~24 방법2 → 이자율곡선 → 상각표 → 결과 → 회계처리"),
-      ("도달확률", "02 전환가격이 경로가중치 방법을 쓸 때 참조한다."),
+      # 시트는 앱에서 고른 방법만 만든다. 안내도 실제로 만들어진 시트만
+      # 적어야 한다 — 없는 시트를 가리키면 조서를 읽는 사람이 헤맨다.
+      ("흐름", " → ".join(["가정"] + [x for x in wb.sheetnames
+                                    if x not in ("가정", "해설")])),
+      ("담긴 것", "앱에서 고른 방법의 트리만 들어 있다. 고르지 않은 방법 "
+                "(다른 신용위험 처리, 다른 매도청구권 평가방법)의 시트는 "
+                "아예 만들지 않는다."),
+      ("도달확률", "02 전환가격이 경로가중치 방법을 쓸 때 참조한다. "
+                 "앞 열에서 한 칸씩 쌓는 재귀식이다 — 구간마다 q 가 달라 "
+                 "이항계수 한 방으로는 셀 수 없다."),
       ("16 부채요소", "전환이 없으면 주가와 무관해 한 줄로 끝난다. 결과 시트가 이 값을 쓴다."),
       ("", ""),
       ("05~09가 순환처럼 보이는 이유", ""),
@@ -3726,11 +3833,18 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
       ("", ""),
       ("주의", ""),
       ("상태확장", "수식 조서는 재결합 격자에서만 만들 수 있다. 앱이 경로가중치로 대체한다."),
-      ("매도청구권", "⑰~⑳ 이 혼합할인율(방법1), ㉑~㉔ 가 지분·부채 분리(방법2)다. "
-                    "결과 시트에 세 방법이 나란히 나오고, "
-                 "가정 시트의 평가방법 값으로 어느 쪽을 적용할지 고른다."),
-      ("신용위험 처리", "가정 시트의 TF/GS 플래그가 결과 시트 1번의 '적용' 두 행을 고른다. "
-                       "주계약과 부채요소는 전환이 없어 두 모형이 같다."),
+      ("매도청구권", "이 조서는 "
+                    + ["유무가치비교법(⑮ 트랜치 두 개의 차이)",
+                       "옵션차익 · 혼합할인율(⑰~⑳)",
+                       "옵션차익 · 지분·부채 분리(⑰⑲㉑~㉔)"][tm.k_method]
+                    + " 으로 잰다. 가정 시트의 평가방법 줄은 그 사실을 적어 둔 "
+                      "것이지 고르는 칸이 아니다 — 다른 방법의 트리는 이 조서에 "
+                      "없다."),
+      ("신용위험 처리", ("이 조서는 TF 로 잰다. " if tm.model == "TF"
+                       else "이 조서는 GS 로 잰다. ")
+                     + "고르지 않은 쪽의 트리는 만들지 않았으므로 가정 시트의 "
+                       "TF/GS 줄을 바꿔도 값이 따라오지 않는다. 주계약과 "
+                       "부채요소는 전환이 없어 두 모형이 같다."),
       ("이자율곡선", "각 트리 11·12행 선도이자율의 출처다. 부트스트래핑 표까지 남긴다."),
       ("상각표", "유효이자율만 역산 결과라 값이고, 상각 내역은 수식이다. "
                 "기말 잔액이 만기상환금액과 맞는지 마지막 줄에서 검산한다."),
@@ -3852,6 +3966,29 @@ with st.sidebar:
             t.p_yield = st.number_input("조기상환 보장수익률 (%)", value=t.p_yield*100, step=0.5)/100
             t.p_cmp = int(st.number_input("복리 횟수 (연)", value=int(t.p_cmp), step=1, min_value=1))
             st.caption("행사금액 = 100 × (1 + 실효수익률)^경과연수")
+
+        st.divider()
+        st.markdown("**회계 처리**")
+        _psok = (t.conv_class == "equity" and t.k_sep != 0)
+        t.p_sep = 1 if st.selectbox(
+            "조기상환권 처리", [1, 0], index=0 if int(t.p_sep) else 1,
+            format_func=lambda x: ("분리 · 파생상품부채" if x
+                                   else "분리하지 않음 · 부채요소에 포함"),
+            disabled=not _psok,
+            help="행사금액이 상각후원가와 거의 같으면 주채무계약과 밀접하게 "
+                 "관련되어 분리하지 않습니다 (기준서 1109 문단 B4.3.5(5)(가)). "
+                 "「분리 판단」 탭이 계약 조항으로 이 결론을 내 줍니다.") else 0
+        if not _psok:
+            st.caption("전환권을 **자본**으로 두고 매도청구권을 **별도 금융상품**으로 "
+                       "볼 때만 고를 수 있습니다. 매도청구권을 내재파생으로 묶으면 "
+                       "복수의 내재파생을 하나의 복합내재파생으로 다루므로 "
+                       "(문단 B4.3.4) 조기상환권도 함께 분리됩니다. 전환권이 "
+                       "부채여도 같은 이유로 묶음에 들어갑니다.")
+            t.p_sep = 1
+        elif int(t.p_sep) == 0:
+            st.caption("부채요소(사채 + 조기상환권)를 통째로 상각후원가로 둡니다. "
+                       "파생상품부채를 세우지 않고, 상각표도 부채요소에서 "
+                       "출발합니다. 전환권대가는 어느 쪽이든 같습니다.")
 
         st.divider()
         st.markdown("**평가 방법**")
@@ -4033,6 +4170,28 @@ with st.sidebar:
                                + "** 이므로 "
                                + ("국고채" if t.bdt_base else "회사채(평가대상 등급)")
                                + " 시계열을 쓰셔야 맞습니다.")
+                    # 시계열의 금리 수준과 격자가 쓰는 곡선의 수준을 견준다.
+                    # 8% 회사채로 변동성을 재고 2.5% 공사채 곡선에 태우면
+                    # 서로 다른 채권을 섞은 것이다.
+                    try:
+                        _RFc, _CRc = curves(t)
+                        _lvl = (_RFc(t.T) if t.bdt_base else _CRc(t.T))*100
+                        _nmc = "무위험 곡선" if t.bdt_base else "위험 곡선"
+                        if _lvl > 0.05 and abs(_v["mean"] - _lvl)/_lvl > 0.5:
+                            st.error(
+                                f"시계열의 평균 금리는 **{_v['mean']:.2f}%** 인데 "
+                                f"격자가 쓰는 {_nmc} 은 잔존 {t.T:.2f}년에서 "
+                                f"**{_lvl:.2f}%** 입니다. 서로 다른 채권입니다 — "
+                                "변동성을 어느 등급에서 뽑았는지, 이자율 칸의 "
+                                "곡선을 어느 줄로 골랐는지 둘 다 확인하십시오. "
+                                "상대변동성이라 수준 자체가 값에 들어가지는 "
+                                "않지만, 근거가 갈리면 조서가 서지 않습니다.")
+                        else:
+                            st.caption(f"시계열 평균 {_v['mean']:.2f}% · "
+                                       f"{_nmc} {t.T:.2f}년 {_lvl:.2f}% — 수준이 "
+                                       "비슷합니다.")
+                    except Exception:
+                        pass
                     if abs(_v["annual"] - t.bdt_sig) > 5e-5:
                         st.warning(f"아직 **적용하지 않았습니다**. 지금 조서에 "
                                    f"들어가는 값은 **{t.bdt_sig*100:.2f}%** "
@@ -4052,7 +4211,16 @@ with st.sidebar:
                                       help="분기복리 4 · 반기 2 · 연 1. 계약서의 "
                                            "매수대금 표와 맞는지 확인하십시오."))
         t.k_w = st.number_input("행사 한도 (%)", value=t.k_w*100, step=5.0)/100
-        t.k_lock = st.number_input("의무보유 전환지연 (개월)", value=float(t.k_lock), step=1.0)
+        t.k_lock = st.number_input(
+            "의무보유 전환지연 (개월)", value=float(t.k_lock), step=1.0,
+            help="매도청구 기간 동안 그 부분을 전환하지 못하게 하는 조건입니다. "
+                 "**유무가치비교법에서만** 값에 들어갑니다.")
+        if t.k_method != 0:
+            st.warning("의무보유는 지금 고른 평가방법에서 **값을 움직이지 "
+                       "않습니다.** 옵션차익법은 기초자산을 「콜과 그 부속조항을 "
+                       "뺀 전환사채」로 보기 때문입니다 (책 4.4.3). 의무보유 "
+                       "효과까지 콜 값에 넣으시려면 **유무가치비교법**을 "
+                       "고르십시오.")
         t.k_sep = 1 if st.selectbox(
             "회계 처리", ["별도 금융상품", "복합내재파생에 포함"],
             index=0 if t.k_sep else 1,
@@ -4533,6 +4701,21 @@ with tabs[2]:
                 columns=["항목", "값"]), use_container_width=True, hide_index=True)
         st.markdown("**평가방법** — " + _d["평가"])
 
+    if not _sp["put"]["설정일치"]:
+        st.error("사이드바의 **조기상환청구권 → 회계 처리** 설정이 위 판정과 "
+                 f"어긋납니다. 판정은 **{_sp['put']['결론']}** 인데 설정은 "
+                 + ("분리 · 파생상품부채" if int(t.p_sep) else "분리하지 않음")
+                 + " 입니다. 배분표와 분개가 판정과 다르게 나오므로 사이드바에서 "
+                   "맞추십시오.")
+    elif (_sp["put"].get("스위치") and _sp["put"]["결론"] == "분리하지 않을 여지"):
+        st.info("조기상환권은 **어느 쪽도 설명할 수 있는** 자리입니다. 지금 설정은 "
+                + ("**분리 · 파생상품부채**" if int(t.p_sep)
+                   else "**분리하지 않음 · 부채요소에 포함**")
+                + " 입니다. 사이드바 **조기상환청구권 → 회계 처리** 에서 바꿀 수 "
+                  "있고, 어느 쪽을 골랐는지와 그 이유를 조서에 적으십시오. "
+                  "전환권대가는 어느 쪽이든 같고, 갈리는 것은 부채 표시와 "
+                  "후속측정입니다 — 분리하면 파생상품부채를 매기 공정가치로 "
+                  "재평가하고, 분리하지 않으면 부채요소를 상각후원가로 굴립니다.")
     if not _sp["call"]["설정일치"]:
         st.error("사이드바의 **매도청구권 → 회계 처리** 설정이 위 판정과 "
                  f"어긋납니다. 판정은 **{_sp['call']['결론']}** 인데 설정은 "
