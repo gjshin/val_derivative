@@ -52,6 +52,10 @@ class Terms:
     k_cmp: int = 4
     k_w: float = 0.30
     k_lock: float = 25.0
+    k_third: int = 1              # 매도청구권을 제3자에게 지정할 수 있는가
+    k_transfer: int = 0           # 매도청구권을 사채와 독립적으로 양도할 수 있는가
+    p_lost_int: int = 0           # 조기상환 행사금액이 상실이자 보상 수준인가
+    fvpl_whole: int = 0           # 복합계약 전체를 당기손익-공정가치로 지정했는가
     k_method: int = 0
     k_sep: int = 1                  # 1 별도 금융상품 / 0 복합내재파생에 포함            # 0 유무가치비교 / 1 혼합할인율 / 2 지분·부채 분리
     sig: float = 0.4130
@@ -707,6 +711,182 @@ def decompose(tm: Terms):
         ca = tm.k_w*(b2-b3)
     resid = 100 - b1 + ca          # 전환권이 자본일 때의 잔여 (전환권대가)
     return full, b0, b1, b2, ca, resid
+
+# 분리 판단에서 "행사가격이 상각후원가와 거의 같다" 로 볼 문턱.
+# 기준서는 "거의 같다" 라고만 하고 수치를 주지 않는다. 실무에서 널리 쓰는
+# 10% 를 기본으로 두되, 문턱 근처면 그 사실 자체를 알린다.
+SPLIT_TOL = 0.10
+
+
+def _close_test(strike, amort):
+    """행사가격과 상각후원가가 '거의 같은가' — 문단 B4.3.5(5)(가)."""
+    gap = abs(strike - amort)/max(abs(amort), 1e-9)
+    return gap, gap <= SPLIT_TOL
+
+
+def split_test(tm: Terms, full, b0, b1, b2, ca, rows_eir):
+    """조기상환권·매도청구권을 주계약과 분리해야 하는지 계약 조항으로 판단한다.
+
+    판단 순서가 정해져 있다. 문단 B4.3.5 말미가 못박는다 — "기업회계기준서
+    제1032호에 따라 전환채무상품의 자본요소를 분리하기 **전에** 내재된
+    콜옵션이나 풋옵션이 주채무계약과 밀접하게 관련되어 있는지를 판단한다."
+
+    돌려주는 것은 옵션마다 결론·근거·평가방법·지표를 담은 사전이다. 화면과
+    조서가 같은 것을 쓰므로 둘이 어긋날 수 없다.
+    """
+    n, dt_ = int(tm.n), tm.T/int(tm.n)
+    ey = tm.elapsed_m/12
+    liab = tm.conv_class != "equity"
+
+    def amort_at(t_year):
+        """그 시점 주계약의 상각후원가 — 실제로 인식한 배분액에서 상각한 값."""
+        return next((en for _, tt_, _b, _i, _c, en in rows_eir
+                     if tt_ >= t_year - 1e-9), b0)
+
+    out = {}
+
+    # ── 조기상환청구권 ────────────────────────────────────────
+    if tm.p_s > tm.p_e or tm.T <= 0:
+        out["put"] = dict(있음=False, 결론="해당 없음",
+                          이유=["계약에 조기상환청구권이 없습니다."],
+                          근거=[], 평가="—", 지표={})
+    else:
+        pv = (100*(1 + accrue_rate(tm.p_s/12, tm.p_yield, tm.cpn, tm.p_cmp))
+              if tm.p_mode == "accrue" else tm.p_rate)
+        bv = amort_at(max(0.0, (tm.p_s - tm.elapsed_m)/12))
+        gap, close = _close_test(pv, bv)
+        why, cite = [], []
+        if tm.fvpl_whole:
+            res = "분리하지 않음"
+            why.append("복합계약 전체를 당기손익-공정가치로 측정하므로 분리 요건이 "
+                       "성립하지 않습니다.")
+            cite.append("1109 문단 4.3.3(3)")
+        elif liab:
+            res = "묶어서 분리"
+            why.append("전환권이 파생상품부채이므로 조기상환권을 따로 떼지 않고 "
+                       "전환권과 하나의 복합내재파생상품으로 묶어 전체로서 "
+                       "측정합니다. 전환하거나 상환받거나 둘 중 하나라 서로 "
+                       "배타적이어서, 따로 재어 더하면 총액이 부풀려집니다.")
+            cite.append("1109 문단 B4.3.4")
+        elif tm.p_lost_int:
+            res = "분리하지 않음"
+            why.append("행사가격이 잔여기간 상실이자의 현재가치를 보상하는 "
+                       "수준이므로 주계약과 밀접하게 관련되어 있습니다.")
+            cite.append("1109 문단 B4.3.5(5)(나)")
+        elif close:
+            res = "분리하지 않을 여지"
+            why.append(f"첫 조기상환일 행사금액 {pv:,.2f} 와 같은 시점 주계약 "
+                       f"상각후원가 {bv:,.2f} 의 차이가 {gap*100:.1f}% 로 "
+                       "거의 같습니다. 밀접하게 관련되어 있다고 볼 여지가 "
+                       "있습니다.")
+            cite.append("1109 문단 B4.3.5(5)(가)")
+        else:
+            res = "분리"
+            why.append(f"첫 조기상환일 행사금액 {pv:,.2f} 와 같은 시점 주계약 "
+                       f"상각후원가 {bv:,.2f} 의 차이가 {gap*100:.1f}% 로 "
+                       "거의 같지 않습니다.")
+            why.append("같은 조건의 별도 금융상품이 파생상품의 정의를 충족하고, "
+                       "복합계약 전체를 당기손익-공정가치로 측정하지 않습니다.")
+            cite += ["1109 문단 B4.3.5(5)", "문단 4.3.3"]
+        val = ("순차 차감 — 조기상환권만 얹은 값에서 옵션 없는 사채를 뺍니다 "
+               f"(B1 − B0 = {b1-b0:,.4f}). 전환권과 대체 관계라 따로 재어 "
+               "더하면 총액이 부풀려집니다."
+               if res == "분리" else
+               "묶음 전체를 공정가치로 측정합니다 (B2 − B0)." if res == "묶어서 분리"
+               else "분리하지 않으므로 주계약에 포함해 상각후원가로 측정합니다.")
+        out["put"] = dict(있음=True, 결론=res, 이유=why, 근거=cite, 평가=val,
+                          지표={"첫 조기상환일 행사금액": pv,
+                                "같은 시점 상각후원가": bv,
+                                "차이": gap})
+
+    # ── 매도청구권 ────────────────────────────────────────────
+    ks = full["kstrike"]
+    first_k = next((i for i in range(n+1) if ks(i) is not None), None)
+    if tm.k_w <= 0 or first_k is None:
+        out["call"] = dict(있음=False, 결론="해당 없음",
+                           이유=["계약에 매도청구권이 없거나 행사 가능한 시점이 "
+                                 "없습니다."], 근거=[], 평가="—", 지표={})
+    else:
+        kv = ks(first_k)
+        kb = amort_at(first_k*dt_)
+        kgap, kclose = _close_test(kv, kb)
+        why, cite = [], []
+        if tm.k_third or tm.k_transfer:
+            res = "별도의 금융상품"
+            why.append("계약상 " + ("발행회사가 제3자를 지정할 수 있어 거래상대방이 "
+                                  "달라질 수 있습니다. " if tm.k_third else "")
+                       + ("사채와 독립적으로 양도할 수 있습니다. "
+                          if tm.k_transfer else "")
+                       + "내재파생상품이 아니라 별도의 금융상품이므로 분리 요건을 "
+                         "따질 것 없이 처음부터 별개의 파생상품으로 인식합니다.")
+            cite.append("1109 문단 4.3.1 마지막 문장")
+        elif tm.fvpl_whole:
+            res = "분리하지 않음"
+            why.append("복합계약 전체를 당기손익-공정가치로 측정하므로 분리 요건이 "
+                       "성립하지 않습니다.")
+            cite.append("1109 문단 4.3.3(3)")
+        elif liab:
+            res = "묶어서 분리"
+            why.append("발행회사만 행사할 수 있어 내재파생상품이고, 전환권이 "
+                       "파생상품부채이므로 전환권·조기상환권과 하나의 "
+                       "복합내재파생상품으로 묶어 전체로서 측정합니다.")
+            cite.append("1109 문단 B4.3.4")
+        elif kclose:
+            res = "분리하지 않을 여지"
+            why.append(f"첫 매도청구일 매매대금 {kv:,.2f} 와 같은 시점 주계약 "
+                       f"상각후원가 {kb:,.2f} 의 차이가 {kgap*100:.1f}% 로 "
+                       "거의 같습니다.")
+            cite.append("1109 문단 B4.3.5(5)(가)")
+        else:
+            res = "분리"
+            why.append(f"발행회사만 행사할 수 있어 내재파생상품이고, 첫 매도청구일 "
+                       f"매매대금 {kv:,.2f} 와 같은 시점 주계약 상각후원가 "
+                       f"{kb:,.2f} 의 차이가 {kgap*100:.1f}% 로 거의 같지 "
+                       "않습니다.")
+            cite += ["1109 문단 4.3.1", "문단 B4.3.5(5)"]
+        if res == "별도의 금융상품":
+            val = ("기초자산이 전환사채 전체인 미국형 복합옵션이므로 "
+                   "**옵션차익혼합할인법**이 개념적으로 정합합니다. 다만 계약에 "
+                   "의무보유 조건이 있으면 그 효과를 값에 넣으려고 "
+                   "유무가치비교법을 쓰기도 합니다 — 재는 대상이 다르므로 "
+                   "고른 방법을 조서에 밝히십시오."
+                   if tm.k_lock > tm.cv_s else
+                   "기초자산이 전환사채 전체인 미국형 복합옵션이므로 "
+                   "**옵션차익혼합할인법**이 개념적으로 정합합니다.")
+        elif res in ("분리", "묶어서 분리"):
+            val = ("순차 차감 — 콜을 넣고 뺀 차액입니다 "
+                   f"(적용값 {ca:,.4f}). 의무보유로 잃는 전환권 가치까지 값에 "
+                   "들어가므로, 계약에 의무보유가 없으면 그만큼 과대해집니다."
+                   if tm.k_lock > tm.cv_s else
+                   f"순차 차감 — 콜을 넣고 뺀 차액입니다 (적용값 {ca:,.4f}).")
+        else:
+            val = "분리하지 않으므로 주계약에 포함해 상각후원가로 측정합니다."
+        out["call"] = dict(있음=True, 결론=res, 이유=why, 근거=cite, 평가=val,
+                           지표={"첫 매도청구일 매매대금": kv,
+                                 "같은 시점 상각후원가": kb,
+                                 "차이": kgap,
+                                 "제3자 지정 가능": bool(tm.k_third),
+                                 "독립 양도 가능": bool(tm.k_transfer)})
+
+    # 화면에서 고른 회계 처리와 판정이 어긋나면 알린다
+    want = 1 if out["call"]["결론"] == "별도의 금융상품" else 0
+    out["call"]["설정일치"] = (not out["call"]["있음"]) or (tm.k_sep == want)
+    return out
+
+
+def split_memo(sp) -> str:
+    """분리 판단을 조서에 옮길 글로 편다. 화면과 조서가 같은 문안을 쓴다."""
+    out = []
+    for key, nm in (("put", "조기상환청구권"), ("call", "매도청구권")):
+        d = sp[key]
+        if not d["있음"]:
+            out.append(f"[{nm}] {d['이유'][0]}"); continue
+        out.append(f"[{nm}] 결론 — {d['결론']}\n"
+                   + "\n".join("  · " + x for x in d["이유"])
+                   + (f"\n  근거 — {' · '.join(d['근거'])}" if d["근거"] else "")
+                   + "\n  평가방법 — " + d["평가"].replace("**", ""))
+    return "\n\n".join(out)
+
 
 def allocate(tm: Terms, full, b0, b1, b2, ca):
     """최초 인식 배분.  전환권 분류에 따라 무엇을 잔여로 두는지가 뒤바뀐다.
@@ -2392,6 +2572,40 @@ def build_xlsx(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         for j2, v in enumerate(row[1:], start=4):
             put(M, 13+i, j2, v, bold=last, fill=fl, fmt=N2, align="right", border=True)
 
+    # ── 분리 판단 ──
+    # 화면과 같은 함수가 만든 문안이라 둘이 어긋날 수 없다.
+    SP = split_test(tm, full, b0, b1, b2, ca, eir[1])
+    J = wb.create_sheet("분리 판단"); J.sheet_view.showGridLines = False
+    J.column_dimensions["B"].width = 24; J.column_dimensions["C"].width = 92
+    title(J, 2, "내재파생상품 분리 판단", span=2)
+    put(J, 3, 2, "판단 순서 — 기업회계기준서 제1109호 문단 B4.3.5 말미는 제1032호에 "
+                 "따라 전환채무상품의 자본요소를 분리하기 전에 내재된 콜옵션이나 "
+                 "풋옵션이 주채무계약과 밀접하게 관련되어 있는지를 판단하라고 정한다.",
+        color=GREY, size=9)
+    _r = 5
+    for _k, _nm in (("put", "조기상환청구권"), ("call", "매도청구권")):
+        _d = SP[_k]
+        sec(J, _r, _nm, span=2); _r += 1
+        put(J, _r, 2, "결론", bold=True, border=True)
+        put(J, _r, 3, _d["결론"], bold=True, border=True); _r += 1
+        for _i, _x in enumerate(_d["이유"]):
+            put(J, _r, 2, "판단 근거" if _i == 0 else "", border=True)
+            put(J, _r, 3, _x, border=True); _r += 1
+        put(J, _r, 2, "기준서", border=True)
+        put(J, _r, 3, " · ".join(_d["근거"]) or "—", border=True); _r += 1
+        put(J, _r, 2, "평가방법", border=True)
+        put(J, _r, 3, _d["평가"].replace("**", ""), border=True); _r += 1
+        for _a, _v in _d["지표"].items():
+            put(J, _r, 2, _a, border=True)
+            put(J, _r, 3, (f"{_v*100:.1f}%" if _a == "차이" else
+                           ("예" if _v is True else "아니오" if _v is False
+                            else f"{_v:,.4f}")), border=True); _r += 1
+        _r += 1
+    put(J, _r, 2, "이 시트는 앱의 「분리 판단」 화면과 같은 함수가 만든다. 계약 조항 "
+                  "확인 항목을 바꾸면 결론과 문안이 함께 바뀐다.", color=GREY, size=9)
+    for _row in J.iter_rows(min_row=5, max_row=_r, min_col=3, max_col=3):
+        for _c in _row: _c.alignment = Alignment(wrap_text=True, vertical="top")
+
     # ── 해설 ──
     H = wb.create_sheet("해설", 0); H.sheet_view.showGridLines = False
     H.column_dimensions["B"].width = 22; H.column_dimensions["C"].width = 96
@@ -3391,6 +3605,40 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     put(E, 23, 3, '=IF(ABS(C22-D22)<0.01,"적합","오류")', align="center", border=True)
     put(E, 25, 2, "최초 인식에는 어떠한 손익도 생기지 않는다.", color=GREY, size=9)
 
+    # ── 분리 판단 ──
+    # 화면과 같은 함수가 만든 문안이라 둘이 어긋날 수 없다.
+    SP = split_test(tm, full, b0, b1, b2, ca, eir[1])
+    J = wb.create_sheet("분리 판단"); J.sheet_view.showGridLines = False
+    J.column_dimensions["B"].width = 24; J.column_dimensions["C"].width = 92
+    title(J, 2, "내재파생상품 분리 판단", span=2)
+    put(J, 3, 2, "판단 순서 — 기업회계기준서 제1109호 문단 B4.3.5 말미는 제1032호에 "
+                 "따라 전환채무상품의 자본요소를 분리하기 전에 내재된 콜옵션이나 "
+                 "풋옵션이 주채무계약과 밀접하게 관련되어 있는지를 판단하라고 정한다.",
+        color=GREY, size=9)
+    _r = 5
+    for _k, _nm in (("put", "조기상환청구권"), ("call", "매도청구권")):
+        _d = SP[_k]
+        sec(J, _r, _nm, span=2); _r += 1
+        put(J, _r, 2, "결론", bold=True, border=True)
+        put(J, _r, 3, _d["결론"], bold=True, border=True); _r += 1
+        for _i, _x in enumerate(_d["이유"]):
+            put(J, _r, 2, "판단 근거" if _i == 0 else "", border=True)
+            put(J, _r, 3, _x, border=True); _r += 1
+        put(J, _r, 2, "기준서", border=True)
+        put(J, _r, 3, " · ".join(_d["근거"]) or "—", border=True); _r += 1
+        put(J, _r, 2, "평가방법", border=True)
+        put(J, _r, 3, _d["평가"].replace("**", ""), border=True); _r += 1
+        for _a, _v in _d["지표"].items():
+            put(J, _r, 2, _a, border=True)
+            put(J, _r, 3, (f"{_v*100:.1f}%" if _a == "차이" else
+                           ("예" if _v is True else "아니오" if _v is False
+                            else f"{_v:,.4f}")), border=True); _r += 1
+        _r += 1
+    put(J, _r, 2, "이 시트는 앱의 「분리 판단」 화면과 같은 함수가 만든다. 계약 조항 "
+                  "확인 항목을 바꾸면 결론과 문안이 함께 바뀐다.", color=GREY, size=9)
+    for _row in J.iter_rows(min_row=5, max_row=_r, min_col=3, max_col=3):
+        for _c in _row: _c.alignment = Alignment(wrap_text=True, vertical="top")
+
     # ── 해설 ──
     H = wb.create_sheet("해설", 0); H.sheet_view.showGridLines = False
     H.column_dimensions["B"].width = 22; H.column_dimensions["C"].width = 96
@@ -4023,8 +4271,8 @@ c1.metric(f"전환사채 공정가치 · {t.model}", f"{b2:,.2f}", help="매도�
 c2.metric("지분가치", f"{eq:,.2f}", help="주식으로 받게 될 부분")
 c3.metric("부채가치", f"{dv:,.2f}", help="현금으로 받게 될 부분")
 
-tabs = st.tabs(["구성요소", "회계처리", "이자율곡선", "주가·변동성", "의사결정",
-                "상각표", "민감도", "검산", "조서"])
+tabs = st.tabs(["구성요소", "회계처리", "분리 판단", "이자율곡선", "주가·변동성",
+                "의사결정", "상각표", "민감도", "검산", "조서"])
 
 with tabs[0]:
     df = pd.DataFrame([
@@ -4089,6 +4337,74 @@ with tabs[1]:
     st.code(je, language=None)
 
 with tabs[2]:
+    st.write("조기상환청구권과 매도청구권을 **주계약과 분리해야 하는지**를 계약 "
+             "조항에 근거해 판단하고, 분리한다면 어떤 방법으로 재는지까지 "
+             "정리합니다. 아래 문안을 그대로 조서에 옮기실 수 있습니다.")
+    st.caption("판단 순서가 정해져 있습니다 — 문단 B4.3.5 말미가 "
+               "\"제1032호에 따라 전환채무상품의 자본요소를 분리하기 전에 "
+               "내재된 콜옵션이나 풋옵션이 주채무계약과 밀접하게 관련되어 "
+               "있는지를 판단한다\" 고 못박습니다.")
+
+    st.markdown("**계약 조항 확인** — 사이드바에 없는 사실만 여기서 받습니다")
+    f1, f2 = st.columns(2)
+    t.k_third = 1 if f1.checkbox(
+        "매도청구권을 제3자에게 지정할 수 있다", value=bool(t.k_third),
+        help="공시에 \"발행회사 및 발행회사가 지정하는 자\" 로 적혀 있으면 "
+             "해당합니다. 거래상대방이 달라질 수 있어 내재파생상품이 아니라 "
+             "별도의 금융상품입니다 (문단 4.3.1 마지막 문장).") else 0
+    t.k_transfer = 1 if f2.checkbox(
+        "매도청구권을 사채와 독립적으로 양도할 수 있다", value=bool(t.k_transfer),
+        help="같은 문단의 다른 갈래입니다. 둘 중 하나만 해당해도 별도의 "
+             "금융상품입니다.") else 0
+    f3, f4 = st.columns(2)
+    t.p_lost_int = 1 if f3.checkbox(
+        "조기상환 행사금액이 상실이자 보상 수준이다", value=bool(t.p_lost_int),
+        help="잔여기간에 못 받게 된 이자의 현재가치를 보상하는 수준이면 주계약과 "
+             "밀접하게 관련되어 있어 분리하지 않습니다 (문단 B4.3.5(5)(나)). "
+             "국내 사모 CB 는 대개 해당하지 않습니다.") else 0
+    t.fvpl_whole = 1 if f4.checkbox(
+        "복합계약 전체를 당기손익-공정가치로 지정했다", value=bool(t.fvpl_whole),
+        help="전체를 공정가치로 재면 내재파생을 따로 뗄 이유가 없습니다 "
+             "(문단 4.3.3(3)). 실무에서 드뭅니다.") else 0
+
+    # 상각표는 아래 탭에서 만들어지므로 여기서 따로 부른다. 판단이 쓰는 것은
+    # 실제로 인식한 배분액에서 상각한 장부금액이다.
+    _sp = split_test(t, full, b0, b1, b2, ca,
+                     eir_table(t, acc_host(t, full, b0, b1, b2, ca))[1])
+    st.divider()
+
+    for _key, _nm in (("put", "조기상환청구권"), ("call", "매도청구권")):
+        _d = _sp[_key]
+        st.markdown(f"### {_nm}")
+        if not _d["있음"]:
+            st.info(_d["이유"][0]); continue
+        _box = (st.success if _d["결론"] in ("분리", "별도의 금융상품", "묶어서 분리")
+                else st.warning)
+        _box(f"**{_d['결론']}**　—　" + " ".join(_d["이유"]))
+        if _d["근거"]:
+            st.caption("근거 · " + " · ".join(_d["근거"]))
+        if _d["지표"]:
+            st.dataframe(pd.DataFrame(
+                [[k2, (f"{v2*100:.1f}%" if k2 == "차이" else
+                       ("예" if v2 is True else "아니오" if v2 is False
+                        else f"{v2:,.4f}"))] for k2, v2 in _d["지표"].items()],
+                columns=["항목", "값"]), use_container_width=True, hide_index=True)
+        st.markdown("**평가방법** — " + _d["평가"])
+
+    if not _sp["call"]["설정일치"]:
+        st.error("사이드바의 **매도청구권 → 회계 처리** 설정이 위 판정과 "
+                 f"어긋납니다. 판정은 **{_sp['call']['결론']}** 인데 설정은 "
+                 + ("별도 금융상품" if t.k_sep else "복합내재파생에 포함")
+                 + " 입니다. 배분표와 분개가 판정과 다르게 나오므로 사이드바에서 "
+                   "맞추십시오.")
+
+    st.divider()
+    st.markdown("**조서에 옮길 문안**")
+    st.code(split_memo(_sp), language=None)
+    st.caption("판단 순서·근거 문단·지표가 함께 들어 있습니다. 결론만 적는 것과 "
+               "달리 감사인이 다시 물을 여지를 줄입니다.")
+
+with tabs[3]:
     RF, CR = curves(t)
     dt_ = t.T/t.n
     rows = []
@@ -4124,7 +4440,7 @@ with tabs[2]:
     st.caption("선도이자율  f(t, t+Δt) = [ r(t+Δt)×(t+Δt) − r(t)×t ] ÷ Δt. "
                "격자의 한 스텝 할인이 이 값을 씁니다.")
 
-with tabs[3]:
+with tabs[4]:
     if not st.session_state.prices:
         st.info("왼쪽 변동성 칸에서 주가를 수집하거나 파일을 넣으십시오. "
                 "국내 6자리 종목은 한국거래소를, 실패하면 야후 파이낸스를 씁니다.")
@@ -4151,7 +4467,7 @@ with tabs[3]:
         st.dataframe(pxdf.tail(10).iloc[::-1].style.format({"종가": "{:,.0f}"}),
                      use_container_width=True, hide_index=True)
 
-with tabs[4]:
+with tabs[5]:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -4199,7 +4515,7 @@ with tabs[4]:
     st.caption("거의 모든 경로가 만기 전에 끝나면 기대만기가 계약만기보다 짧다는 뜻이고, "
                "장기 할인율의 영향이 줄어듭니다.")
 
-with tabs[5]:
+with tabs[6]:
     r_eir, rows_eir, red, nper = eir_table(t, acc_host(t, full, b0, b1, b2, ca))
     st.dataframe(pd.DataFrame([
         ["주계약 (옵션 없는 사채)", f"{b0:,.2f}"], ["만기상환금액", f"{red:,.2f}"],
@@ -4214,7 +4530,7 @@ with tabs[5]:
                  use_container_width=True, hide_index=True, height=320)
     st.caption("기말 장부금액이 만기에 상환금액과 일치해야 합니다.")
 
-with tabs[6]:
+with tabs[7]:
     rows = []
     for dvv in (-0.15, -0.075, 0.0, 0.075, 0.15):
         tt = Terms(**asdict(t)); tt.sig = max(0.01, t.sig+dvv)
@@ -4238,7 +4554,7 @@ with tabs[6]:
     st.caption("구조에 따라 값을 지배하는 인풋이 다릅니다. "
                "변동성 영향이 거의 없다면 민감도 공시 대상은 할인율이어야 합니다.")
 
-with tabs[7]:
+with tabs[8]:
     imm = 100*t.S0/t.K0
     tot_al = allocate(t, full, b0, b1, b2, ca)[0][-1][1]
     checks = [("위험중립가중치 q", f"{full['q']:.4f}", 0 < full["q"] < 1),
@@ -4452,7 +4768,7 @@ with tabs[7]:
                "조기상환권이 832.14에서 836.22로 0.49%만 움직인다고 실측합니다. "
                "민감도가 크더라도 금리변동성이 낮으면 값 차이는 작을 수 있습니다.")
 
-with tabs[8]:
+with tabs[9]:
     st.write("가정 · 트리 시트 · 이자율곡선 · 결과 · 회계처리 · 상각표로 이루어진 조서를 만듭니다. "
              "트리 하나가 시트 하나이고, 모든 시트의 머리 17행이 같은 형태입니다.")
     kind = st.radio("조서 형식", ["값", "수식"], horizontal=True,
