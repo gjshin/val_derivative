@@ -940,7 +940,13 @@ def fetch_prices(code: str, days: int, market: str, end: str = None):
             "그동안은 아래에서 주가 파일을 넣으시면 됩니다.") from None
     d2 = dt.date.fromisoformat(end) if end else dt.date.today()
     d1 = d2 - dt.timedelta(days=int(days*1.7)+30)
-    sufs = [""] if not code.isdigit() else ([f".{market}"] if market else [".KQ", ".KS"])
+    # 고른 시장을 먼저 보되 비면 다른 시장도 해 본다. 이전 상장이나 시장 이관이
+    # 있으면 접미사가 어긋나는데, 화면에서는 "자료 없음" 으로만 보여 원인을 못 찾는다.
+    if not code.isdigit():
+        sufs = [""]
+    else:
+        sufs = [f".{market}"] if market else []
+        sufs += [x for x in (".KQ", ".KS") if x not in sufs]
     errs = []
     for suf in sufs:
         sym = code + suf
@@ -959,7 +965,10 @@ def fetch_prices(code: str, days: int, market: str, end: str = None):
             errs.append(f"{sym} {len(rows)}개")
         except Exception as e:
             errs.append(f"{sym} {e}")
-    raise RuntimeError(" / ".join(errs) or "자료를 찾지 못했습니다")
+    # 무엇을 해 봤고 왜 안 됐는지 밝힌다. 옛 yfinance 는 야후가 API 를 바꾸면
+    # 예외 없이 빈 표를 돌려주므로, 판 번호가 있어야 원인을 가릴 수 있다.
+    raise RuntimeError((" / ".join(errs) or "자료를 찾지 못했습니다")
+                       + f"  (yfinance {getattr(yf, '__version__', '?')})")
 
 
 def vol_from(prices, tdays=250, drop_outlier=True):
