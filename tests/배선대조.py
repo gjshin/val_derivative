@@ -25,7 +25,7 @@ WANT = {
     5:  {"kst", "ken", "kfrq"},                # Flag(매도청구)
     6:  {"roff", "cyc"},                       # Flag(리픽싱)
     7:  {"pyld", "cpn", "pcmp", "dt", "elm", "prate"},   # 조기상환금액
-    8:  {"prem", "cpn", "dt", "elm"},          # 매도청구금액
+    8:  {"prem", "cpn", "kcmp", "dt", "elm"},   # 매도청구금액
     9:  {"ipay", "cpn", "ipaym"},              # 쿠폰
     10: {"n", "red"},                          # 만기상환
 }
@@ -48,10 +48,11 @@ def keymap(G):
     src = open(os.path.join(ROOT, "cb_app.py"), encoding="utf-8").read()
     i = src.index('        ("평가기준일 주가", "S0"')
     j = src.index("    ROWN = {key:")
-    keys = re.findall(r'\(\s*"[^"]*"\s*,\s*"(\w+)"', src[i:j])
+    keys = re.findall(r'\(\s*f?"[^"]*"\s*,\s*"(\w+)"', src[i:j])
     # spec 은 발행일부터 시작한다. 그 앞 세 줄을 찾아 붙인다.
     head = src[:i]
-    pre = re.findall(r'\(\s*"[^"]*"\s*,\s*"(\w+)"', head[head.rindex("    spec = ["):])
+    pre = re.findall(r'\(\s*f?"[^"]*"\s*,\s*"(\w+)"',
+                     head[head.rindex("    spec = ["):])
     keys = pre + keys
     return {3+n: k for n, k in enumerate(keys)}
 
@@ -174,7 +175,7 @@ def main():
             if abs(got-want) > worst[0][1]: worst = [("조기상환금액", abs(got-want))]
             # 매도청구금액
             want = (999999 if not inset(i, t.k_s, t.k_e, t.k_f) else
-                    100*(1+ar(i*dt_+ey, t.k_prem, t.cpn, 1)))
+                    100*(1+ar(i*dt_+ey, t.k_prem, t.cpn, t.k_cmp)))
             got = W.cell(8, 3+i).value or 0.0
             if abs(got-want) > worst[0][1]: worst = [("매도청구금액", abs(got-want))]
             # 쿠폰
