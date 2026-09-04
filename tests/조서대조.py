@@ -219,7 +219,9 @@ def main():
         if not eng["sep"]:
             # 콜을 내재파생에 넣으면 자산 줄이 비고 파생 줄이 순액이 된다
             rows_ord = [(nm, r) for nm, r in rows_ord if nm != "매도청구권"]
-            if eng["eq"]: rows_ord[0] = ("주계약", 7); rows_ord[1] = ("복합내재파생상품", 10)
+            if eng["eq"]:
+                rows_ord = [("주계약", 7), ("복합내재파생상품", 10),
+                            ("전환권대가", 12)]
         for nm, r in rows_ord:
             want = want_al.get(nm)
             if nm == "매도청구권": want = -eng["ca"]

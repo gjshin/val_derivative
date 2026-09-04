@@ -3657,10 +3657,12 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     # B4.3.4 가 하나의 복합내재파생으로 다루라고 해서 조기상환권도 딸려 간다.
     NS = f'AND({K["eqcls"]}=1,{KS}=1,{K["psep"]}=0)'
     _HOST = f'=IF({K["eqcls"]}=1,IF({NS},"",결과!C16),결과!C25)'
-    _PUT = (f'=IF(OR({K["eqcls"]}=0,{NS}),"",'
-            f'IF({KS}=1,결과!C18,결과!C18-결과!C22))')
+    _PUT = f'=IF(OR({K["eqcls"]}=0,{KS}=0,{NS}),"",결과!C18)'
     _LIAB = f'=IF({NS},결과!C17,"")'
-    _CMP = f'=IF({K["eqcls"]}=1,"",IF({KS}=1,결과!C24,결과!C24-결과!C22))'
+    # 전환권이 부채면 전환권+조기상환권 묶음, 자본이면서 콜을 내재파생으로
+    # 넣었으면 조기상환권+매도청구권 묶음이다. 어느 쪽이든 순액 한 줄이다.
+    _CMP = (f'=IF({K["eqcls"]}=0,IF({KS}=1,결과!C24,결과!C24-결과!C22),'
+            f'IF({KS}=0,결과!C18-결과!C22,""))')
     _CALL = f'=IF({KS}=1,-결과!C22,"")'
     _EQ = f'=IF({K["eqcls"]}=1,결과!C23,"")'
     al2 = [("주계약", _HOST),
