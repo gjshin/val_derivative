@@ -624,8 +624,22 @@ def bdt_parts(tm: Terms):
     put_a = lambda i: ((100*(1 + accrue_rate(i*dt_ + ey, tm.p_yield, tm.cpn, tm.p_cmp))
                         if tm.p_mode == "accrue" else tm.p_rate)
                        if in_put(i) else 0.0)
+    # 캘리브레이션 검산 재료 — 도달가격 Q 와 시장 할인계수.
+    # Σ_j Q(k,j) 가 시장 할인계수와 같아야 한다. 이것이 무차익거래 조건이고,
+    # 기준금리 a 를 그 조건에 맞춰 역산한 것이다. 조서에서 눈으로 확인하도록
+    # 격자와 함께 내보낸다.
+    base = CR if tm.bdt_base == 0 else RF
+    mkt = [math.exp(-base(k*dt_)*k*dt_) for k in range(n+1)]
+    Q = [[1.0]]
+    for i in range(n):
+        nq = [0.0]*(i+2)
+        for j in range(i+1):
+            d = 0.5*Q[i][j]*math.exp(-rt[i][j]*dt_)
+            nq[j+1] += d; nq[j] += d
+        Q.append(nq)
     return dict(r=rt, a=ab, add=add, n=n, T=T, dt=dt_, red=red, cpn=cpn_amt,
-                is_pay=is_pay, in_put=in_put, put_a=put_a)
+                is_pay=is_pay, in_put=in_put, put_a=put_a, Q=Q, mkt=mkt,
+                base_nm=("위험 곡선" if tm.bdt_base == 0 else "무위험 곡선"))
 
 
 def bdt_grid(tm: Terms, put: bool):
@@ -2041,7 +2055,13 @@ def build_xlsx(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         ("매도청구권 평가방법", K_METHODS[tm.k_method], None),
         ("매도청구권 회계 처리",
          "별도 금융상품" if tm.k_sep else "복합내재파생에 포함", None)]),
-      ("5. 시장 인풋", [("변동성 σ", tm.sig, P2),
+      ("5. 시장 인풋", [("변동성 σ", tm.sig, P2)]
+        + ([("조기상환권 평가", "BDT 금리격자", None),
+            ("BDT 단기이자율 변동성 σ", tm.bdt_sig, P2),
+            ("BDT 기준 곡선", ("위험 곡선에 직접" if tm.bdt_base == 0
+                            else "무위험 + 확정 스프레드"), None)]
+           if put_bdt_on(tm) else [("조기상환권 평가", "금리 고정 격자", None)])
+        + [
         ("무위험 이표 (연 회)", tm.cmp_rf, N0), ("위험 이표 (연 회)", tm.cmp_cr, N0),
         ("이자율 입력", ("만기수익률 곡선" if tm.y_type == "par"
                      else f"현물이자율 곡선 (무위험 {tm.cmp_rf}회·위험 {tm.cmp_cr}회 복리)"), None),
@@ -2181,6 +2201,38 @@ def build_xlsx(tm: Terms, full, b0, b1, b2, ca, conv, eir):
                 put(W, 13+n+2, 2, "t = 0", bold=True)
                 put(W, 13+n+2, 3, round(grid[0][0], 6), bold=True, fmt=N2,
                     align="right")
+            else:
+                # 캘리브레이션 검산 — 도달가격을 더하면 시장 무이표채 가격이다.
+                # 기준금리 a 를 이 조건에 맞춰 역산했으므로 0 이 나와야 한다.
+                QR = 13+n+3
+                sec(W, QR-1, f"캘리브레이션 검산 — 격자가 {BP['base_nm']}을 되돌리는가")
+                put(W, QR, 2, "j ＼ 스텝", bold=True, size=8, fill=LIGHT,
+                    border=True, align="center")
+                for i in range(n+1):
+                    put(W, QR, 3+i, i, bold=True, size=8, fmt=N0, align="center",
+                        fill=LIGHT, border=True)
+                for j in range(n+1):
+                    put(W, QR+1+j, 2, j, bold=True, size=8, fmt=N0,
+                        align="center", fill=LIGHT, border=True)
+                for i in range(n+1):
+                    for j in range(len(BP["Q"][i])):
+                        put(W, QR+1+j, 3+i, round(BP["Q"][i][j], 10), fmt=N6,
+                            size=8, align="right")
+                for k, (nm, fn) in enumerate((
+                        ("모형 무이표채  Σ Q", lambda i: sum(BP["Q"][i])),
+                        ("시장 할인계수", lambda i: BP["mkt"][i]),
+                        ("차이", lambda i: sum(BP["Q"][i]) - BP["mkt"][i]))):
+                    r2 = QR+n+2+k
+                    put(W, r2, 2, nm, bold=True, size=8, fill=LIGHT, border=True)
+                    for i in range(n+1):
+                        put(W, r2, 3+i, round(fn(i), 12), fmt=N6, size=8,
+                            align="right", bold=(k == 2))
+                put(W, QR+n+5, 2,
+                    "도달가격 Q(i,j) 는 그 칸에 이르는 경로의 확률을 그 경로의 "
+                    "할인율로 할인해 더한 값이다. 스텝별로 모두 더하면 그 만기의 "
+                    "무이표채 가격이 되고, 그것이 시장 할인계수와 같아야 한다 — "
+                    "무차익거래 조건이다. 기준금리 a 를 이 조건에 맞춰 이분법으로 "
+                    "역산했으므로 차이가 0 이다.", color=GREY, size=9)
             W.freeze_panes = "C13"
 
     # ── 이자율곡선 ──
@@ -2964,6 +3016,52 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
                     f"={L}$10*EXP(2*{K['bsig']}*$B{RB+j}*SQRT({K['dt']}))",
                     fmt=P2, size=8, align="right")
 
+        # ── 캘리브레이션 검산 ──
+        # 기준금리 a 만 값이라 조서만 보면 근거 없는 상수처럼 보인다. 그래서
+        # 도달가격 Q 를 수식으로 쌓아 보인다. Σ_j Q(k,j) 가 시장 할인계수와
+        # 같아야 하고, a 를 바로 그 조건에 맞춰 역산했다 — 무차익거래 조건이다.
+        QR = RB+n+3
+        sec(W, QR-2, f"캘리브레이션 검산 — 격자가 {BP['base_nm']}을 되돌리는가",
+            span=min(n+1, 14))
+        put(W, QR-1, 2, "j ＼ 스텝", bold=True, size=8, fill=LIGHT,
+            border=True, align="center")
+        for i in range(n+1):
+            put(W, QR-1, 3+i, i, bold=True, size=8, fmt=N0, align="center",
+                fill=LIGHT, border=True)
+        for j in range(n+1):
+            put(W, QR+j, 2, j, bold=True, size=8, fmt=N0, align="center",
+                fill=LIGHT, border=True)
+        for i in range(n+1):
+            L, Lp = gl(3+i), (gl(2+i) if i > 0 else None)
+            for j in range(i+1):
+                if i == 0:
+                    v = 1
+                else:
+                    # 아래에서 올라온 몫 + 위에서 내려온 몫. 삼각형 밖은 비어
+                    # 있으므로 엑셀에서 0 으로 읽힌다.
+                    up = (f"0.5*{Lp}{QR+j-1}*EXP(-{Lp}{RB+j-1}*{K['dt']})"
+                          if j > 0 else "")
+                    dn = (f"0.5*{Lp}{QR+j}*EXP(-{Lp}{RB+j}*{K['dt']})"
+                          if j <= i-1 else "")
+                    v = "=" + "+".join(x for x in (up, dn) if x)
+                put(W, QR+j, 3+i, v, fmt=N6, size=8, align="right")
+        for k2, nm in enumerate(("모형 무이표채  Σ Q", "시장 할인계수", "차이")):
+            r2 = QR+n+1+k2
+            put(W, r2, 2, nm, bold=True, size=8, fill=LIGHT, border=True)
+            for i in range(n+1):
+                L = gl(3+i)
+                v = (f"=SUM({L}{QR}:{L}{QR+n})" if k2 == 0 else
+                     (BP["mkt"][i] if k2 == 1 else f"={L}{r2-2}-{L}{r2-1}"))
+                put(W, r2, 3+i, v, fmt=N6, size=8, align="right",
+                    bold=(k2 == 2), color=(AMB if k2 == 1 else "000000"))
+        put(W, QR+n+5, 2,
+            "도달가격 Q(i,j) 는 그 칸에 이르는 경로의 확률을 그 경로의 할인율로 "
+            "할인해 더한 값이다. 스텝별로 모두 더하면 그 만기의 무이표채 가격이 "
+            "되고, 그것이 시장 할인계수(주황)와 같아야 한다 — 무차익거래 조건이다. "
+            "기준금리 a 를 이 조건에 맞춰 이분법으로 역산했으므로 차이가 0 이다. "
+            "σ 를 바꾸면 a 도 함께 바뀌어야 하므로 앱에서 조서를 다시 만드셔야 "
+            "한다 — 이 시트에서 σ 만 바꾸면 차이가 0 에서 벗어난다.", color=GREY, size=9)
+
         W = wb.create_sheet(SB2)
         bhead(W, "BDT 부채요소  전환 없는 사채 + 조기상환권",
               "MAX(조기상환금액, 계속보유) 를 고른다. 계속보유는 다음 두 칸을 "
@@ -3470,9 +3568,12 @@ with st.sidebar:
                        "성립하지만, 부채이면 복합내재파생을 전체로서 재야 해서 "
                        "전체 가치까지 함께 손봐야 합니다.")
         elif t.put_bdt:
+            # 키를 두지 않는다. 키가 있으면 위젯이 저장해 둔 값이 value 를
+            # 이겨서, 아래 「이 변동성 적용」 도 시나리오 불러오기도 화면에
+            # 반영되지 않는다. 주가 변동성 칸도 같은 이유로 키가 없다.
             t.bdt_sig = st.number_input("단기이자율 변동성 (%)",
                                         value=t.bdt_sig*100, step=1.0,
-                                        min_value=0.0, key="bdtsig")/100
+                                        min_value=0.0)/100
             t.bdt_base = st.selectbox(
                 "기준 곡선", [0, 1], index=int(t.bdt_base),
                 format_func=lambda x: ("위험 곡선에 직접" if x == 0
@@ -3601,6 +3702,7 @@ with st.sidebar:
                     if st.button("이 변동성 적용", use_container_width=True,
                                  type="primary", key="rvapply"):
                         t.bdt_sig = _v["annual"]
+                        st.rerun()
 
     with st.expander("매도청구권"):
         t.k_s = st.number_input("시작 (개월)", value=float(t.k_s), step=1.0, key="ks")
@@ -3682,6 +3784,7 @@ with st.sidebar:
                               if v['removed'] else ""))
                 if st.button("이 변동성 적용", use_container_width=True, type="primary"):
                     t.sig = v["annual"]
+                    st.rerun()
 
         st.divider()
         st.markdown("**비상장 — 피어로 산출**")
