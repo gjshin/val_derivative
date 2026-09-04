@@ -49,6 +49,7 @@ class Terms:
     k_e: float = 24.0
     k_f: float = 3.0
     k_prem: float = 0.01
+    k_cmp: int = 4
     k_w: float = 0.30
     k_lock: float = 25.0
     k_method: int = 0
@@ -323,7 +324,8 @@ def engine(tm: Terms, conv=True, put=True, call=False, conv_start=None):
     put_a = lambda i: put_amt(i) if (put and in_set(i, tm.p_s, tm.p_e, tm.p_f)) else 0.0
     # kstrike 는 콜 스위치와 무관한 행사금액이다. 행사기간이 아니면 None.
     # call_a 는 call=False 면 항상 inf 라 제3자 콜옵션 평가에 쓸 수 없다.
-    kstrike = lambda i: (100*(1 + accrue_rate(i*dt_ + ey, tm.k_prem, tm.cpn, 1))
+    kstrike = lambda i: (100*(1 + accrue_rate(i*dt_ + ey, tm.k_prem, tm.cpn,
+                                             tm.k_cmp))
                          if in_set(i, tm.k_s, tm.k_e, tm.k_f) else None)
     call_a = lambda i: (kstrike(i) if (call and in_set(i, tm.k_s, tm.k_e, tm.k_f))
                         else math.inf)
@@ -1864,7 +1866,7 @@ def build_xlsx(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         return tm.p_rate
     def call_amt(i, on=True):
         if not on or not in_set(i, tm.k_s, tm.k_e, tm.k_f): return 999999
-        return 100*(1 + accrue_rate(i*dt_ + ey, tm.k_prem, tm.cpn, 1))
+        return 100*(1 + accrue_rate(i*dt_ + ey, tm.k_prem, tm.cpn, tm.k_cmp))
 
     HEAD = ["Date", "time-step", "Flag(전환)", "Flag(조기상환)", "Flag(매도청구)",
             "Flag(리픽싱)", "조기상환금액", "매도청구금액", "쿠폰", "만기상환",
@@ -1939,7 +1941,8 @@ def build_xlsx(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         ("조기상환 시작 / 종료 / 주기", tm.p_s, N0), ("　", tm.p_e, N0), ("　 ", tm.p_f, N0),
         ("조기상환 행사금액 산정", "보장수익률 복리" if tm.p_mode == "accrue" else "고정률", None),
         ("매도청구 시작 / 종료 / 주기", tm.k_s, N0), ("　  ", tm.k_e, N0), ("　   ", tm.k_f, N0),
-        ("매도청구 프리미엄", tm.k_prem, P2), ("매도청구 한도", tm.k_w, P2),
+        ("매도청구 프리미엄", tm.k_prem, P2),
+        ("매도청구 복리 횟수 (연)", tm.k_cmp, N0), ("매도청구 한도", tm.k_w, P2),
         ("의무보유 전환지연 (개월)", tm.k_lock, N0),
         ("매도청구권 평가방법", K_METHODS[tm.k_method], None),
         ("매도청구권 회계 처리",
@@ -2310,6 +2313,10 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     DATE = 'yyyy-mm-dd'
     n = tm.n; dt_ = tm.T/n; mper = n/(tm.T*12); R0 = 20
     el = tm.elapsed_m
+    # 트랜치 이름은 계약의 매도청구 한도에서 나온다. 30/70 으로 굳혀 두면
+    # 한도가 다른 사채에서 시트 이름이 계약과 어긋난다.
+    KW = f"{tm.k_w*100:,.0f}%"
+    KW0 = f"{(1-tm.k_w)*100:,.0f}%"
     stp_lo, stp_hi = step_mapper(tm, n, dt_)
     RF, CR = curves(tm)
     # 다음 조정일은 평가기준일부터 (주기 − 경과분) 뒤다. 엔진과 같은 오프셋이다.
@@ -2385,8 +2392,9 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         ("매도청구 종료 (스텝)", "ken", stp_hi(tm.k_e), N0, True),
         ("매도청구 주기 (스텝)", "kfrq", max(1, int(round(tm.k_f*mper))), N0, True),
         ("매도청구 프리미엄", "prem", tm.k_prem, P2, True),
+        ("매도청구 복리 횟수 (연)", "kcmp", tm.k_cmp, N0, True),
         ("매도청구 한도", "cw", tm.k_w, P2, True),
-        ("30% 전환 시작 (스텝)", "cv30", stp_lo(max(tm.cv_s, tm.k_lock)), N0, True),
+        (f"{KW} 전환 시작 (스텝)", "cv30", stp_lo(max(tm.cv_s, tm.k_lock)), N0, True),
         ("변동성 σ", "sig", tm.sig, P2, True),
         ("상승계수 u", "u", "@=EXP(C{sig}*SQRT(C{dt}))", N4, False),
         ("하락계수 d", "dd", "@=1/C{u}", N4, False),
@@ -2455,7 +2463,7 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
                  f"{K['prate']}),0)", N2)
             g(8, f"=IF({L}$5=1,IF({K['prem']}>0,"
                  f"100*(1+MAX(0,({K['prem']}-{K['cpn']})/{K['prem']}*"
-                 f"((1+{K['prem']})^{yr}-1))),"
+                 f"((1+{K['prem']}/{K['kcmp']})^({K['kcmp']}*{yr})-1))),"
                  f"100*(1+MAX(0,-{K['cpn']}*{yr}))),999999)", N2)
             g(9, f"=IF(AND({st}>0,MOD({st},{K['ipay']})=0),"
                  f"100*{K['cpn']}*{K['ipaym']}/12,0)", N2)
@@ -2497,7 +2505,7 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     S5, S6, S7 = "05 지분가치", "06 부채가치", "07 보유가치"
     S8, S9, S10 = "08 금융상품가치", "09 의사결정", "10 주계약가치"
     S11, S12, S13, S14 = "11 GS 전환확률", "12 GS 할인율", "13 GS 보유가치", "14 GS 금융상품가치"
-    S15, S16 = "15 30% 트랜치", "16 부채요소"
+    S15, S16 = f"15 {KW} 트랜치", "16 부채요소"
     S17, S18 = "17 구성비율", "18 혼합할인율"
     S19, S20 = "19 콜 페이오프", "20 매도청구권가치"
     S21, S22 = "21 방법2 지분보유", "22 방법2 부채보유"
@@ -2612,15 +2620,15 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
              f"*EXP(-{L}$12*{K['dt']})+{L}$9"))
 
         W = newsheet(S8, "⑧ 금융상품가치트리",
-                     "70% 트랜치 — 매도청구권이 걸리지 않는다. 콜은 ⑮에서만 반영한다.",
+                     f"{KW0} 트랜치 — 매도청구권이 걸리지 않는다. 콜은 ⑮에서만 반영한다.",
                      f"{S4} · {S7}", call_on=False)
         fill(W, lambda i, r, L, Lp, Ln:
              f"=MAX({Q(S7)}!{L}{R0+r},{Q(S4)}!{L}{R0+r},{L}$7"
              + (f"+{L}$9)" if i == n else ")"))
 
         W = newsheet(S9, "⑨ 의사결정트리",
-                     "전환가치·조기상환금액·보유가치를 직접 견준다. 70% 트랜치라 상환C 는 없다. "
-                     "리픽싱 조정일에는 전환가치가 정확히 100 이 되어 상환금액과 동점이 되므로 "
+                     f"전환가치·조기상환금액·보유가치를 직접 견준다. {KW0} 트랜치라 "
+                     "상환C 는 없다. 리픽싱 조정일에는 전환가치가 정확히 100 이 되어 상환금액과 동점이 되므로 "
                      "전환은 허용오차만큼 앞설 때만 이긴다. 동점이면 현금이다.",
                      f"{S4} · {S7}", call_on=False)
         fill(W, lambda i, r, L, Lp, Ln:
@@ -2665,11 +2673,12 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
              + (f"+{L}$9)" if i == n else ")"))
 
     if _need15:
-        # ── 15 30% 트랜치 ──
+        # ── 15 트랜치 ──
         # 고른 모형의 블록만 담는다. GS 블록은 TF 다섯 블록을 참조하지 않으므로
         # 어느 쪽을 골라도 나머지 절반은 만들 필요가 없다.
-        W = newsheet(S15, "⑮ 30% 트랜치  매도청구권이 걸리는 부분",
-                     "의무보유 때문에 전환 시작이 늦다. 70%와의 차이가 매도청구권의 가치다. "
+        W = newsheet(S15, f"⑮ {KW} 트랜치  매도청구권이 걸리는 부분",
+                     f"의무보유 때문에 전환 시작이 늦다. {KW0}와의 차이가 "
+                     "매도청구권의 가치다. "
                      + ("전환가치 뒤에 GS 네 블록을 둔다. 고른 모형이 GS 이기 때문이다."
                         if _gs else
                         "전환가치 뒤에 TF 다섯 블록을 둔다. 고른 모형이 TF 이기 때문이다."),
@@ -2733,7 +2742,7 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
                     p(c3, f'=IF({L}{c6+1+r}="상환P",{L}$7,IF({L}{c6+1+r}="상환C",{L}$8,'
                           f'IF({L}{c6+1+r}="전환",0,{b}+{L}$9)))')
         else:
-            # ⑪~⑭ 와 같은 순서지만 30% 트랜치 자신의 헤더와 전환가치를 쓴다.
+            # ⑪~⑭ 와 같은 순서지만 트랜치 자신의 헤더와 전환가치를 쓴다.
             c7 = blk("[GS] 전환확률")
             c8 = blk("[GS] 위험조정할인율")
             c9 = blk("[GS] 보유가치")
@@ -2764,7 +2773,7 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         # 오므로 last 를 그대로 쓰면 그 위에 겹쳐 쓰게 된다.
         RT = _bs["row"] + n + 3
         sec(W, RT, "결과", span=6)
-        put(W, RT+1, 2, f"30% 트랜치 금융상품가치 · {tm.model} (t=0)", bold=True)
+        put(W, RT+1, 2, f"{KW} 트랜치 금융상품가치 · {tm.model} (t=0)", bold=True)
         put(W, RT+1, 3, f"=C{last+1}", bold=True, fmt=N2, align="right")
 
     # ── 16 부채요소 ──
@@ -2966,12 +2975,12 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     _t70 = f"={Q(S14)}!C{R0}" if _gs else f"={Q(S8)}!C{R0}"
     _t30 = f"={Q(S15)}!C{RT+1}" if _need15 else B_
     for i, (nm, fx) in enumerate([
-            ("70% 트랜치 · TF", B_ if _gs else _t70),
-            ("70% 트랜치 · GS", _t70 if _gs else B_),
-            ("30% 트랜치 · TF", B_ if _gs else _t30),
-            ("30% 트랜치 · GS", _t30 if _gs else B_),
-            ("적용 · 70% 트랜치", _t70),
-            ("적용 · 30% 트랜치", _t30),
+            (f"{KW0} 트랜치 · TF", B_ if _gs else _t70),
+            (f"{KW0} 트랜치 · GS", _t70 if _gs else B_),
+            (f"{KW} 트랜치 · TF", B_ if _gs else _t30),
+            (f"{KW} 트랜치 · GS", _t30 if _gs else B_),
+            (f"적용 · {KW0} 트랜치", _t70),
+            (f"적용 · {KW} 트랜치", _t30),
             ("가중 평균", f"=(1-{K['cw']})*C10+{K['cw']}*C11" if _need15 else B_)]):
         bold = (i >= 4)
         put(R, 6+i, 2, nm, bold=bold, border=True)
@@ -3205,8 +3214,8 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
                      "결과 시트 3번 검산 마지막 줄에 앱 계산값과의 차이가 나온다."),
       ("", ""),
       ("시트 순서", ""),
-      ("흐름", "가정 → 01 주가 → 02 전환가격 → … → 09 의사결정 → 10 주계약 → "
-              "11~14 GS → 15 30% 트랜치 → 16 부채요소 → 17~20 매도청구권 방법1 → "
+      ("흐름", f"가정 → 01 주가 → 02 전환가격 → … → 09 의사결정 → 10 주계약 → "
+              f"11~14 GS → {S15} → 16 부채요소 → 17~20 매도청구권 방법1 → "
               "21~24 방법2 → 이자율곡선 → 상각표 → 결과 → 회계처리"),
       ("도달확률", "02 전환가격이 경로가중치 방법을 쓸 때 참조한다."),
       ("16 부채요소", "전환이 없으면 주가와 무관해 한 줄로 끝난다. 결과 시트가 이 값을 쓴다."),
@@ -3476,6 +3485,9 @@ with st.sidebar:
         t.k_e = st.number_input("종료 (개월)", value=float(t.k_e), step=1.0, key="ke")
         t.k_f = st.number_input("주기 (개월)", value=float(t.k_f), step=1.0, key="kf")
         t.k_prem = st.number_input("프리미엄 (연 %)", value=t.k_prem*100, step=0.5)/100
+        t.k_cmp = int(st.number_input("복리 횟수 (연)", 1, 12, int(t.k_cmp), 1,
+                                      help="분기복리 4 · 반기 2 · 연 1. 계약서의 "
+                                           "매수대금 표와 맞는지 확인하십시오."))
         t.k_w = st.number_input("행사 한도 (%)", value=t.k_w*100, step=5.0)/100
         t.k_lock = st.number_input("의무보유 전환지연 (개월)", value=float(t.k_lock), step=1.0)
         t.k_sep = 1 if st.selectbox(
