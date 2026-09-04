@@ -1024,6 +1024,26 @@ def validate(tm: Terms):
     if tm.k_w > 0 and tm.k_prem > 0 and tm.k_prem < tm.cpn - 1e-9:
         w.append(f"매도청구 프리미엄({tm.k_prem:.2%})이 표면이자율({tm.cpn:.2%})보다 "
                  "낮습니다. 매도청구금액이 액면 밑으로 내려갑니다.")
+    # 신용스프레드가 너무 얇으면 곡선을 잘못 골랐다는 신호다. 실제로 고시표에서
+    # 「특수채·공사채 AAA」 줄을 눌러 국고채와 사실상 같은 곡선이 들어간 일이
+    # 있었다. 주계약이 부풀고 전환권대가가 그만큼 깎인다.
+    try:
+        _RF, _CR = curves(tm)
+        _sp = _CR(tm.T) - _RF(tm.T)
+        if _sp < 0:
+            w.append(f"위험 곡선이 무위험 곡선보다 **낮습니다** (잔존만기 "
+                     f"{tm.T:.2f}년에서 {_sp*100:+.2f}%p). 두 곡선을 바꿔 "
+                     "넣으셨는지 확인하십시오.")
+        elif _sp < 0.01:
+            w.append(f"신용스프레드가 잔존만기 {tm.T:.2f}년에서 "
+                     f"**{_sp*10000:.0f}bp** 밖에 안 됩니다"
+                     + (f" (위험 곡선 출처 — {tm.cr_src})" if tm.cr_src else "")
+                     + ". 국채·특수채·공사채 줄을 고르셨을 수 있습니다. "
+                       "발행회사 신용등급의 회사채 곡선인지 확인하십시오 — "
+                       "곡선이 낮으면 주계약이 부풀고 전환권대가가 그만큼 "
+                       "깎입니다.")
+    except Exception:
+        pass
     if put_bdt_on(tm):
         if tm.bdt_sig <= 0:
             w.append("BDT 변동성이 0 입니다. 금리 고정 격자와 같은 값이 나옵니다.")
@@ -4013,6 +4033,11 @@ with st.sidebar:
                                + "** 이므로 "
                                + ("국고채" if t.bdt_base else "회사채(평가대상 등급)")
                                + " 시계열을 쓰셔야 맞습니다.")
+                    if abs(_v["annual"] - t.bdt_sig) > 5e-5:
+                        st.warning(f"아직 **적용하지 않았습니다**. 지금 조서에 "
+                                   f"들어가는 값은 **{t.bdt_sig*100:.2f}%** "
+                                   "입니다. 아래 단추를 누르셔야 산출한 값이 "
+                                   "BDT 격자에 들어갑니다.")
                     if st.button("이 변동성 적용", use_container_width=True,
                                  type="primary", key="rvapply"):
                         t.bdt_sig = _v["annual"]
@@ -4056,7 +4081,17 @@ with st.sidebar:
                            format_func=lambda x: {"KQ": "코스닥", "KS": "코스피", "": "해외"}[x])
         c3, c4 = st.columns(2)
         pdays = int(c3.number_input("조회 일수", value=250, step=10, min_value=30))
-        tdays = int(c4.number_input("연 거래일수", value=250, step=5))
+        tdays = int(c4.number_input(
+            "연 거래일수", value=250, step=5,
+            help="1년에 며칠 거래하나입니다. 국내 증시는 약 245~250일입니다. "
+                 "**받아온 자료가 며칠치인가(조회 일수)와 다릅니다.** 여기에 "
+                 "관측 개수를 넣으면 연환산이 어긋납니다."))
+        if not 200 <= tdays <= 300:
+            st.warning(f"연 거래일수가 **{tdays}일** 입니다. 국내 증시는 약 "
+                       "245~250일입니다. 이 칸은 「1년에 며칠 거래하나」이지 "
+                       "「몇 일치를 받아왔나」가 아닙니다 — 그건 위의 **조회 "
+                       f"일수** 칸입니다. 지금 값이면 σ 가 √({tdays}÷250) = "
+                       f"{(tdays/250)**0.5:.3f} 배로 나옵니다.")
         st.caption("야후 파이낸스 수정주가를 씁니다. 유상증자·액면분할·배당이 반영된 종가입니다.")
         asof = st.date_input("조회 종료일", value=dt.date.today())
         drop = st.checkbox("이상치 제거 (중앙값 절대편차 2.5배)", value=True,
@@ -4096,6 +4131,10 @@ with st.sidebar:
                            + (f" · 이상치 {v['removed']}개 제거 "
                               f"(정상범위 {v['lo']*100:.2f}% ~ {v['hi']*100:.2f}%)"
                               if v['removed'] else ""))
+                if abs(v["annual"] - t.sig) > 5e-5:
+                    st.warning(f"아직 **적용하지 않았습니다**. 지금 조서에 들어가는 "
+                               f"값은 **{t.sig*100:.2f}%** 입니다. 아래 단추를 "
+                               "누르셔야 산출한 값이 계산에 들어갑니다.")
                 if st.button("이 변동성 적용", use_container_width=True, type="primary"):
                     t.sig = v["annual"]
                     st.rerun()
@@ -4911,6 +4950,29 @@ with tabs[9]:
         if t.carry == 0 and t.rfx_mode > 0:
             st.warning("상태확장은 한 노드에 전환가격이 여럿이라 수식으로 펼 수 없습니다. "
                        "경로가중치로 대체해 만듭니다. 값이 조금 달라집니다.")
+    # 산출해 놓고 적용하지 않은 변동성이 있으면 여기서 막아 세운다. 조서를
+    # 만드는 자리가 마지막 관문이라, 사이드바 경고를 놓쳐도 여기서는 보인다.
+    _unap = []
+    _pv = st.session_state.get("prices") or []
+    if _pv:
+        _vv = vol_from(_pv, (st.session_state.get("vol_opt") or {}).get("tdays", 250),
+                       (st.session_state.get("vol_opt") or {}).get("drop", True))
+        if _vv and abs(_vv["annual"] - t.sig) > 5e-5:
+            _unap.append(f"주가 변동성 — 산출 **{_vv['annual']*100:.2f}%** / "
+                         f"조서에 들어가는 값 **{t.sig*100:.2f}%**")
+    _rv = st.session_state.get("rate_series") or []
+    if _rv and put_bdt_on(t):
+        _ro = st.session_state.get("rate_opt") or {}
+        _vr = rate_vol(_rv, _ro.get("tdays", 250), _ro.get("drop", True))
+        if _vr and abs(_vr["annual"] - t.bdt_sig) > 5e-5:
+            _unap.append(f"BDT 단기이자율 변동성 — 산출 **{_vr['annual']*100:.2f}%** / "
+                         f"조서에 들어가는 값 **{t.bdt_sig*100:.2f}%**")
+    if _unap:
+        st.warning("**산출해 놓고 적용하지 않은 변동성이 있습니다.**\n\n"
+                   + "\n".join(f"- {x}" for x in _unap)
+                   + "\n\n왼쪽 칸의 「이 변동성 적용」을 누르셔야 조서에 들어갑니다. "
+                     "지금 만들면 위의 **조서에 들어가는 값**으로 계산됩니다.")
+
     c1, c2 = st.columns([1, 2])
     if c1.button("조서 만들기", type="primary", use_container_width=True):
         try:
