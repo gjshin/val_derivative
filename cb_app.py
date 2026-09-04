@@ -67,7 +67,8 @@ class Terms:
     p_yield: float = 0.0         # 조기상환 보장수익률
     p_cmp: int = 4               # 조기상환 보장수익률 복리 횟수
     face_total: float = 25_000_000_000.0   # 전자등록총액 (원)
-    rate_mode: str = "direct"     # direct 곡선 직접 / rating 등급 보간
+    rate_mode: str = "direct"      # direct 직접 · pick 등급 하나 · rating 두 등급 보간
+    cr_src: str = ""               # 위험 곡선을 어디서 가져왔는지 (조서에 적는다)     # direct 곡선 직접 / rating 등급 보간
     rt_a: str = "BBB+"            # 인풋 곡선 A 등급
     rt_b: str = "BBB-"            # 인풋 곡선 B 등급
     rt_tgt: str = "BBB0"          # 평가대상 등급
@@ -1948,19 +1949,30 @@ def build_xlsx_rate(tm: Terms):
     for k, v in [("입력 유형", "현물이자율(제로커브)" if spot_in else "만기수익률(YTM)"),
                  ("무위험 복리 횟수 (연)", int(tm.cmp_rf)),
                  ("위험 복리 횟수 (연)", int(tm.cmp_cr)),
-                 ("위험 곡선", "등급 보간" if tm.rate_mode == "rating" else "직접 입력"),
+                 ("위험 곡선 방식", {"pick": "표에서 등급 하나",
+                                  "rating": "두 등급 보간"}.get(tm.rate_mode,
+                                                          "직접 입력")),
+                 ("위험 곡선 출처", tm.cr_src or "직접 입력"),
                  ("평가기준일", tm.d_base), ("만기일", tm.d_mat),
                  ("잔존기간 T (년)", round(T, 8)), ("노드 수 n", n),
                  ("한 구간 Δt (년)", round(dt_, 8)),
-                 ("변동성 σ", tm.sig)]:
+                 ("주가 변동성 σ", tm.sig)]:
         put(C, r, 2, k, bold=True, border=True, fill=RPT["light"])
-        put(C, r, 3, v, border=True, fmt=(R_P2 if k == "변동성 σ" else None),
-            align=None if isinstance(v, str) else "right")
+        put(C, r, 3, v, border=True, fmt=(R_P2 if k == "주가 변동성 σ" else None),
+            align=None if isinstance(v, str) else "right", wrap=True)
         r += 1
     r += 1
     note(C, r, "노란 셀만 입력이다. 만기와 수익률을 고치면 부트스트래핑부터 선도까지 "
                "전부 다시 계산된다. 다만 만기 칸을 늘리거나 줄이려면 앱에서 곡선을 "
                "바꿔 리포트를 다시 만들어야 한다 — 표의 길이는 구조라 수식으로 늘지 않는다.")
+    r += 1
+    note(C, r, "주가 변동성 σ 는 이자율 산출에 쓰이지 않는다. 선도이자율 시트의 "
+               "위험중립가중치 q = [exp(f·Δt) − d] ÷ (u − d) 에서 u·d 를 만드는 데만 "
+               "쓴다 — q 가 이자율과 주가를 잇는 자리라 여기 함께 적어 둔다.")
+    r += 1
+    note(C, r, "위험 곡선 출처는 앱의 이자율 칸에서 고른 그대로다. 두 등급 보간이면 "
+               "아래 입력곡선 시트의 위험 열이 이미 섞인 곡선이고, 등급 하나를 "
+               "고르셨으면 고시표의 그 줄이 그대로 들어간다.")
 
     # ── 입력곡선 ──
     I = sheet(IN, widths=[12, 16, 15, 5, 12, 16, 15])
@@ -4178,22 +4190,58 @@ with st.sidebar:
                                        "48\t6.65%\n60\t7.05%")
         rf_txt = st.text_area("무위험 곡선 (국공채 YTM)", key="rf_txt", height=130)
         t.rf_curve = parse_yields(rf_txt, unit)
-        t.rate_mode = st.selectbox("위험 곡선", ["direct", "rating"],
-                                   index=0 if t.rate_mode == "direct" else 1,
-                                   format_func=lambda x: "YTM 직접 입력" if x == "direct"
-                                   else "두 등급 곡선으로 보간")
-        if t.rate_mode == "direct":
+        _MODES = ["pick", "direct", "rating"]
+        _MODE_NM = {"pick": "표에서 등급 하나 고르기",
+                    "direct": "YTM 직접 입력",
+                    "rating": "두 등급 곡선으로 보간"}
+        if t.rate_mode not in _MODES: t.rate_mode = "direct"
+        t.rate_mode = st.selectbox("위험 곡선", _MODES,
+                                   index=_MODES.index(t.rate_mode),
+                                   format_func=lambda x: _MODE_NM[x],
+                                   help="고시표를 올리셨으면 **등급 하나 고르기**가 "
+                                        "가장 짧습니다. 평가대상 등급이 표에 없을 "
+                                        "때만 두 등급 보간을 쓰십시오.")
+        _kr = st.session_state.get("kis_rows") or []
+        _kg = [(i, rating_in(L)) for i, (L, _) in enumerate(_kr)]
+        _kg = [(i, g) for i, g in _kg if g]
+        _pick = sorted({g for _, g in _kg}, key=rating_idx)
+
+        if t.rate_mode == "pick":
+            # 고시표의 한 줄을 그대로 위험 곡선으로 쓴다. 텍스트 칸을 거치지
+            # 않으므로 "고른 등급과 실제로 쓰인 곡선이 다른" 사고가 없다.
+            if not _kr:
+                st.info("고시표를 아직 올리지 않으셨습니다. 위에서 KIS-Net 표를 "
+                        "올리시거나, **YTM 직접 입력**으로 바꾸십시오. 그동안은 "
+                        "아래 직접 입력 칸을 씁니다.")
+                cr_txt = st.text_area("위험 곡선 (등급별 회사채 YTM)",
+                                      key="cr_txt", height=130)
+                t.cr_curve = parse_yields(cr_txt, unit); t.cr_curve_b = []
+                t.cr_src = "직접 입력"
+            else:
+                _idx = [i for i, _ in _kg] or list(range(len(_kr)))
+                _prev = next((i for i in _idx if _kr[i][0] == t.cr_src), _idx[0])
+                _pi = st.selectbox("위험 곡선으로 쓸 줄", _idx,
+                                   index=_idx.index(_prev),
+                                   format_func=lambda i: _kr[i][0])
+                t.cr_curve = list(_kr[_pi][1]); t.cr_curve_b = []
+                t.cr_src = _kr[_pi][0]
+                _g = rating_in(t.cr_src)
+                if _g: t.rt_tgt = _g
+                st.success(f"**{t.cr_src}** 을 그대로 씁니다 — "
+                           + " · ".join(f"{int(round(m*12))}월 {y*100:.2f}%"
+                                        for m, y in t.cr_curve[:6])
+                           + (" …" if len(t.cr_curve) > 6 else ""))
+                st.caption("표의 만기가 그대로 들어갑니다. 아래 직접 입력 칸은 이 "
+                           "방식에서는 쓰이지 않습니다.")
+        elif t.rate_mode == "direct":
             cr_txt = st.text_area("위험 곡선 (등급별 회사채 YTM)", key="cr_txt", height=130)
             t.cr_curve = parse_yields(cr_txt, unit)
             t.cr_curve_b = []
+            t.cr_src = "직접 입력"
         else:
             # 표를 올리셨으면 **그 표에 있는 등급만** 고르게 한다. 고시표에 없는
             # 등급을 곡선으로 고르면 붙여 넣을 자료가 없다 — 무보증 공모사채는
             # 대개 BBB- 까지만 고시한다.
-            _kr = st.session_state.get("kis_rows") or []
-            _kg = [(i, rating_in(L)) for i, (L, _) in enumerate(_kr)]
-            _kg = [(i, g) for i, g in _kg if g]
-            _pick = sorted({g for _, g in _kg}, key=rating_idx)
             _opts = _pick or RATINGS
             _at = lambda r, d: _opts.index(r) if r in _opts else min(d, len(_opts)-1)
             r1, r2, r3 = st.columns(3)
@@ -4223,6 +4271,7 @@ with st.sidebar:
             cb_txt = st.text_area(f"{t.rt_b} 곡선", key="cb_txt", height=100)
             t.cr_curve = parse_yields(ca_txt, unit)
             t.cr_curve_b = parse_yields(cb_txt, unit)
+            t.cr_src = f"{t.rt_a}·{t.rt_b} 두 등급 보간 → {t.rt_tgt}"
             ia, ib, it2 = rating_idx(t.rt_a), rating_idx(t.rt_b), rating_idx(t.rt_tgt)
             if ia >= 0 and ib >= 0 and it2 >= 0 and ia != ib:
                 w = (it2-ia)/(ib-ia)
@@ -4399,6 +4448,147 @@ with tabs[2]:
                    "맞추십시오.")
 
     st.divider()
+    st.markdown("## 평가방법 — 어떻게 잴 것인가")
+
+    # ── 조기상환권 : 확정 계산으로 충분한가, 금리모형이 필요한가 ──
+    st.markdown("### 조기상환청구권 — 금리모형(BDT)을 켤 것인가")
+    st.caption("전환을 끄면 격자가 주가와 무관해져 스텝마다 값이 하나뿐입니다. "
+               "즉 지금 조기상환권은 **미리 내다보고 액면이 더 크면 행사한다**는 "
+               "확정 계산이고, 옵션의 시간가치가 들어 있지 않습니다. "
+               "행사가 뻔하면 그래도 맞는 답이 나오지만, 애매하면 값을 0 에 "
+               "가깝게 잡습니다. 그 자리가 금리모형이 필요한 자리입니다.")
+    if t.p_s <= t.p_e and t.T > 0:
+        _r0 = engine(t, conv=False, put=False, call=False)
+        _dtx = t.T/int(t.n)
+        _lo2, _hi2 = step_mapper(t, int(t.n), _dtx)
+        _mp = int(t.n)/(t.T*12)
+        _pr = max(1, int(round(t.p_f*_mp)))
+        _s2, _e2 = _lo2(t.p_s), _hi2(t.p_e)
+        _at2 = {}
+        for _k3, _v3 in _r0["memo"].items():
+            _at2.setdefault(_k3[0], _v3)
+        _rows2, _rat2 = [], []
+        for _i3 in range(max(_s2, 0), _e2+1):
+            if (_i3-_s2) % _pr or _i3 not in _at2: continue
+            _hold = _at2[_i3]["E"] + _at2[_i3]["B"]
+            _amt = (100*(1 + accrue_rate(_i3*_dtx + t.elapsed_m/12, t.p_yield,
+                                         t.cpn, t.p_cmp))
+                    if t.p_mode == "accrue" else t.p_rate)
+            _rat2.append(_amt/max(_hold, 1e-9))
+            _rows2.append([_i3, round(t.elapsed_m + _i3*_dtx*12), _amt, _hold,
+                           _rat2[-1]])
+        if _rows2:
+            _atm2 = sum(1 for x in _rat2 if 0.97 <= x <= 1.03)
+            _otm2 = sum(1 for x in _rat2 if x < 0.97)
+            st.dataframe(pd.DataFrame(
+                _rows2, columns=["스텝", "발행 후 개월", "행사금액", "계속보유가치",
+                                 "행사금액 ÷ 계속보유"]).style.format(
+                {"행사금액": "{:,.2f}", "계속보유가치": "{:,.2f}",
+                 "행사금액 ÷ 계속보유": "{:.3f}"}),
+                use_container_width=True, hide_index=True, height=240)
+            st.caption("마지막 열이 **1 보다 크면** 그 날 상환받는 편이 낫다는 뜻입니다. "
+                       "행사가 확정적이라 금리를 흔들어도 판단이 안 바뀝니다. "
+                       "**1 근처(0.97~1.03)이거나 1보다 작으면** 금리에 따라 판단이 "
+                       "갈리므로 확정 계산이 값을 적게 잡습니다.")
+            if _otm2 == len(_rat2):
+                st.error(f"모든 행사일이 **외가격**입니다 (비율 최대 {max(_rat2):.3f}). "
+                         f"지금 모델은 조기상환권을 {b1-b0:,.2f} 로 계산하는데, "
+                         "외가격 옵션에도 시간가치가 있습니다. **금리모형 없이는 값을 "
+                         "0 에 가깝게 잡습니다.** 사이드바에서 BDT 를 켜십시오.")
+            elif _atm2 + _otm2 > 0:
+                st.warning(f"등가격 근처가 {_atm2}회, 외가격이 {_otm2}회 있습니다 "
+                           f"(비율 {min(_rat2):.3f} ~ {max(_rat2):.3f}). 행사 여부가 "
+                           "금리에 따라 갈릴 수 있으므로 BDT 를 켜서 차이를 "
+                           "확인하고 그 판단을 조서에 남기십시오.")
+            else:
+                st.success(f"모든 행사일에서 행사금액이 계속보유가치보다 큽니다 "
+                           f"(비율 {min(_rat2):.3f} ~ {max(_rat2):.3f}). 행사가 "
+                           "확정적이라 금리를 확률변수로 두어도 판단이 바뀌지 "
+                           "않습니다. **확정 격자로 충분합니다.**")
+        st.caption("현재 설정 — 조기상환권을 "
+                   + ("**BDT 금리격자**로 잽니다." if put_bdt_on(t) else
+                      "**금리 고정 격자**로 잽니다.")
+                   + ("" if put_bdt_on(t) else
+                      "  BDT 는 전환권이 자본이고 TF 일 때만 켤 수 있습니다."))
+    else:
+        st.info("조기상환청구권이 없어 판단할 것이 없습니다.")
+
+    # ── 매도청구권 : 세 방법을 나란히 ──
+    st.markdown("### 매도청구권 — 세 방법 중 무엇으로 잴 것인가")
+    if t.k_w > 0:
+        _mv = []
+        for _km, _lb in ((0, "유무가치비교법"), (1, "옵션차익 · 혼합할인율"),
+                         (2, "옵션차익 · 지분·부채 분리")):
+            _tk = Terms(**asdict(t)); _tk.k_method = _km; derive(_tk)
+            _mv.append([_lb, decompose(_tk)[4], "◀ 적용" if t.k_method == _km else ""])
+        st.dataframe(pd.DataFrame(_mv, columns=["방법", "값", "　"]).style.format(
+            {"값": "{:,.4f}"}), use_container_width=True, hide_index=True)
+        st.caption("**어느 쪽이 옳다기보다 재는 대상이 다릅니다.** 유무가치비교법은 "
+                   "콜을 넣고 뺀 차액이라 **의무보유로 잃는 전환권 가치까지** 값에 "
+                   "들어갑니다. 옵션차익혼합할인법은 전환사채를 기초자산으로 하는 "
+                   "콜옵션 자체만 잽니다. 보고서를 검토하실 때도 어느 방법을 썼는지 "
+                   "먼저 확인하셔야 합니다.")
+        st.info("판정에 따른 권고 — " + _sp["call"]["평가"].replace("**", ""))
+    else:
+        st.info("매도청구권이 없어 판단할 것이 없습니다.")
+
+    # ── 금리 민감도로 본 금리모형 실익 ──
+    with st.expander("금리모형이 값을 얼마나 바꾸는가 — 민감도로 본 실익"):
+        RFc, CRc = curves(t)
+
+        def _bump(**kw):
+            tt = Terms(**asdict(t))
+            for k2, v2 in kw.items(): setattr(tt, k2, v2)
+            derive(tt); return pick(engine(tt, call=False), t.model)
+        # BDT 는 금리 "수준" 을 확률변수로 둔다. 두 곡선을 함께 흔들어야 노출을
+        # 제대로 잰다 — 무위험만 흔들면 스프레드와 상쇄되어 크게 과소하게 잡힌다.
+        _par2 = lambda d: dict(rf_curve=[(x, y+d) for x, y in t.rf_curve],
+                               cr_curve=[(x, y+d) for x, y in t.cr_curve],
+                               cr_curve_b=[(x, y+d) for x, y in t.cr_curve_b])
+        _dl = (_bump(**_par2(0.01)) - _bump(**_par2(-0.01)))/2
+        _ds = (_bump(cr_curve=[(x, y+0.01) for x, y in t.cr_curve],
+                     cr_curve_b=[(x, y+0.01) for x, y in t.cr_curve_b])
+               - _bump(cr_curve=[(x, y-0.01) for x, y in t.cr_curve],
+                       cr_curve_b=[(x, y-0.01) for x, y in t.cr_curve_b]))/2
+        _dv = (_bump(sig=t.sig+0.10) - _bump(sig=max(0.01, t.sig-0.10)))/2
+        _ratio = abs(_dl)/max(abs(_dv), 1e-9)
+        _spr = CRc(t.T) - RFc(t.T)
+        _share = _spr/CRc(t.T) if CRc(t.T) > 1e-9 else 0.0
+        st.dataframe(pd.DataFrame([
+            ["금리 수준 ±1%p (두 곡선 평행)", f"{_dl:+,.4f}",
+             f"{abs(_dl)/max(b2,1e-9)*100:.2f}%"],
+            ["신용스프레드 ±1%p (위험 곡선만)", f"{_ds:+,.4f}",
+             f"{abs(_ds)/max(b2,1e-9)*100:.2f}%"],
+            ["변동성 ±10%p", f"{_dv:+,.4f}", f"{abs(_dv)/max(b2,1e-9)*100:.2f}%"],
+            ["금리 수준 ÷ 주가 민감도", f"{_ratio:.3f}", ""],
+            [f"{t.T:.2f}년 신용스프레드", f"{_spr*100:.2f}%p",
+             f"할인율 중 {_share*100:.0f}%"]],
+            columns=["항목", "값", "비중"]), use_container_width=True,
+            hide_index=True)
+        if _ratio < 0.2 or _share > 0.7:
+            st.success("금리를 확률변수로 둘 실익이 작습니다. 신용스프레드가 값을 "
+                       "지배하므로 금리 고정 격자로 충분합니다.")
+        else:
+            st.warning("금리 수준 민감도가 무시할 수준이 아닙니다. BDT 적용 여부를 "
+                       "검토하고 그 판단을 조서에 남기십시오.")
+        st.caption("두 곡선을 함께 흔드는 이유 — 부채 부분은 위험이자율로 할인되므로 "
+                   "무위험 곡선만 흔들면 스프레드 변화와 상쇄되어 노출이 최대 수십 배 "
+                   "과소하게 잡힙니다.")
+
+    # ── 회계처리 ──
+    st.divider()
+    st.markdown("## 회계처리 — 판정대로 배분하면")
+    _rows_al, _note_al = allocate(t, full, b0, b1, b2, ca)
+    st.dataframe(pd.DataFrame(
+        [[k2, v2, fv2] for k2, v2, fv2 in allocate_full(t, _rows_al)],
+        columns=["항목", "100 기준", "전액 기준 (원)"]).style.format(
+        {"100 기준": "{:,.4f}", "전액 기준 (원)": "{:,.0f}"}),
+        use_container_width=True, hide_index=True)
+    st.caption(_note_al)
+    st.caption("분개는 **회계처리** 탭에 있습니다. 여기서는 판정이 배분에 어떻게 "
+               "닿는지만 보입니다.")
+
+    st.divider()
     st.markdown("**조서에 옮길 문안**")
     st.code(split_memo(_sp), language=None)
     st.caption("판단 순서·근거 문단·지표가 함께 들어 있습니다. 결론만 적는 것과 "
@@ -4555,6 +4745,8 @@ with tabs[7]:
                "변동성 영향이 거의 없다면 민감도 공시 대상은 할인율이어야 합니다.")
 
 with tabs[8]:
+    st.write("**계산이 성립하는지**만 봅니다. 무엇을 분리하고 어떻게 잴지는 "
+             "「분리 판단」 탭으로 옮겼습니다.")
     imm = 100*t.S0/t.K0
     tot_al = allocate(t, full, b0, b1, b2, ca)[0][-1][1]
     checks = [("위험중립가중치 q", f"{full['q']:.4f}", 0 < full["q"] < 1),
@@ -4568,84 +4760,6 @@ with tabs[8]:
                               columns=["항목", "값", "판정"]),
                  use_container_width=True, hide_index=True)
     st.caption("위험중립가중치가 0과 1을 벗어나면 변동성이나 노드 수 설정이 잘못된 것입니다.")
-
-    st.markdown("**조기상환권 분리 판단** — 기준서 1109 문단 B4.3.5(5)")
-    # 행사금액은 발행일부터 붙으므로 p_s(발행일 기준 개월)를 그대로 쓴다
-    _pv = (100*(1 + accrue_rate(t.p_s/12, t.p_yield, t.cpn, t.p_cmp))
-           if t.p_mode == "accrue" else t.p_rate)
-    _pt = max(0.0, (t.p_s - t.elapsed_m)/12)       # 평가기준일 기준 첫 조기상환일
-    _rw = eir_table(t, acc_host(t, full, b0, b1, b2, ca))[1]
-    _bv = next((en for _, tt_, _b, _i, _c, en in _rw if tt_ >= _pt - 1e-9), b0)
-    _gap = abs(_pv - _bv)/max(_bv, 1e-9)
-    st.dataframe(pd.DataFrame([
-        ["첫 조기상환일 행사금액", f"{_pv:,.2f}"],
-        ["같은 시점 주계약 상각후원가", f"{_bv:,.2f}"],
-        ["차이", f"{_gap*100:.1f}%"]],
-        columns=["항목", "값"]), use_container_width=True, hide_index=True)
-    if _gap > 0.10:
-        st.success("행사금액과 상각후원가가 거의 같지 않으므로 조기상환권을 주계약과 "
-                   "분리합니다. 앱의 배분도 분리를 전제로 합니다.")
-    else:
-        st.warning("행사금액이 상각후원가와 거의 같습니다. 문단 B4.3.5(5)(가) 예외에 "
-                   "해당해 분리하지 않을 여지가 있습니다. 앱은 항상 분리하므로 "
-                   "회계처리 탭의 배분을 그대로 쓰기 전에 판단을 확인하십시오.")
-    st.caption("자본요소를 분리하기 **전에** 판단해야 하는 항목입니다 (문단 B4.3.5 말미).")
-
-    st.markdown("**조기상환권에 옵션가치가 남아 있는가**")
-    st.caption("전환을 끄면 격자가 주가와 무관해져 스텝마다 값이 하나뿐입니다. "
-               "즉 지금 조기상환권은 **불확실성이 없는 확정 계산**입니다 — "
-               "미리 내다보고 액면이 더 크면 행사하는 것뿐이라, 옵션의 시간가치가 "
-               "들어 있지 않습니다. 행사금액이 계속보유가치보다 뚜렷이 크면 행사가 "
-               "확정적이라 그래도 무방합니다. 반대로 등가격 근처이거나 외가격이면 "
-               "값을 놓치고 있는 것이고, 그때 금리모형이 필요합니다.")
-    if t.p_s <= t.p_e and t.T > 0:
-        _r0 = engine(t, conv=False, put=False, call=False)
-        _mm = _r0["memo"]
-        _dt = t.T/int(t.n)
-        _lo, _hi = step_mapper(t, int(t.n), _dt)
-        _mper = int(t.n)/(t.T*12)
-        _per = max(1, int(round(t.p_f*_mper)))
-        _s, _e = _lo(t.p_s), _hi(t.p_e)
-        # 상태확장이면 memo 키가 (i, j, 전환가격) 3튜플이다. 전환을 껐으므로
-        # 같은 스텝의 값은 어차피 하나뿐이라 첫 항목을 쓰면 된다.
-        _at = {}
-        for _k, _v in _mm.items():
-            _at.setdefault(_k[0], _v)
-        _rows, _rat = [], []
-        for _i in range(max(_s, 0), _e+1):
-            if (_i-_s) % _per or _i not in _at: continue
-            _hold = _at[_i]["E"] + _at[_i]["B"]
-            _amt = (100*(1 + accrue_rate(_i*_dt + t.elapsed_m/12, t.p_yield,
-                                         t.cpn, t.p_cmp))
-                    if t.p_mode == "accrue" else t.p_rate)
-            _rat.append(_amt/max(_hold, 1e-9))
-            _rows.append([_i, round(t.elapsed_m + _i*_dt*12), _amt, _hold, _rat[-1]])
-        if _rows:
-            _atm = sum(1 for x in _rat if 0.97 <= x <= 1.03)
-            _otm = sum(1 for x in _rat if x < 0.97)
-            st.dataframe(pd.DataFrame(
-                _rows, columns=["스텝", "발행 후 개월", "행사금액", "계속보유가치",
-                                "행사금액 ÷ 계속보유"]).style.format(
-                {"행사금액": "{:,.2f}", "계속보유가치": "{:,.2f}",
-                 "행사금액 ÷ 계속보유": "{:.3f}"}),
-                use_container_width=True, hide_index=True, height=260)
-            if _otm == len(_rat):
-                st.error(f"모든 행사일이 **외가격**입니다 (비율 최대 {max(_rat):.3f}). "
-                         f"지금 모델은 조기상환권을 {b1-b0:,.2f} 로 계산하는데, "
-                         "실제로는 외가격 옵션에도 시간가치가 있습니다. "
-                         "**금리모형 없이는 값을 0 에 가깝게 잡습니다.** "
-                         "조기상환권만 따로 BDT 등으로 평가하는 것을 검토하십시오.")
-            elif _atm + _otm > 0:
-                st.warning(f"등가격 근처가 {_atm}회, 외가격이 {_otm}회 있습니다 "
-                           f"(비율 {min(_rat):.3f} ~ {max(_rat):.3f}). 행사 여부가 "
-                           "금리에 따라 갈릴 수 있으므로 확정 계산이 옵션가치를 "
-                           "적게 잡습니다. 조기상환권만 금리모형으로 다시 재 보고 "
-                           "차이가 중요한지 확인하십시오.")
-            else:
-                st.success(f"모든 행사일에서 행사금액이 계속보유가치보다 큽니다 "
-                           f"(비율 {min(_rat):.3f} ~ {max(_rat):.3f}). 행사가 "
-                           "확정적이라 금리를 확률변수로 두어도 판단이 바뀌지 않습니다. "
-                           "확정 계산으로 충분합니다.")
 
     st.markdown("**신용스프레드가 발행조건과 맞는가**")
     st.caption("발행일에는 투자자가 100 을 내고 사채 + 조기상환권 + 전환권을 삽니다. "
@@ -4727,46 +4841,6 @@ with tabs[8]:
                    "수익률을 쓰는 것이 원칙이고, 역산은 **인풋이 발행조건과 얼마나 "
                    "떨어져 있는지 재는 자**입니다. 괴리가 크면 등급 추정이나 "
                    "만기보장수익률 입력을 다시 보십시오.")
-
-    st.markdown("**금리모형(BDT 등) 적용 필요여부**")
-    RFc, CRc = curves(t)
-    def _bump(**kw):
-        tt = Terms(**asdict(t))
-        for k2, v2 in kw.items(): setattr(tt, k2, v2)
-        derive(tt); return pick(engine(tt, call=False), t.model)
-    # BDT 는 금리 "수준" 을 확률변수로 둔다. 그러니 두 곡선을 함께 흔들어야
-    # 금리 노출을 제대로 잰다. 무위험 곡선만 흔들면 스프레드가 그만큼 줄었다
-    # 늘었다 하며 상쇄되고, 부채 부분은 위험이자율로 할인되므로 거의 안 움직인다.
-    _par = lambda d: dict(rf_curve=[(x, y+d) for x, y in t.rf_curve],
-                          cr_curve=[(x, y+d) for x, y in t.cr_curve])
-    d_lvl = (_bump(**_par(0.01)) - _bump(**_par(-0.01)))/2
-    d_spr = (_bump(cr_curve=[(x, y+0.01) for x, y in t.cr_curve])
-             - _bump(cr_curve=[(x, y-0.01) for x, y in t.cr_curve]))/2
-    d_vol = (_bump(sig=t.sig+0.10) - _bump(sig=max(0.01, t.sig-0.10)))/2
-    ratio = abs(d_lvl)/max(abs(d_vol), 1e-9)
-    spr = CRc(t.T) - RFc(t.T)
-    share = spr/CRc(t.T) if CRc(t.T) > 1e-9 else 0.0
-    st.dataframe(pd.DataFrame([
-        ["금리 수준 ±1%p (두 곡선 평행)", f"{d_lvl:+,.4f}",
-         f"{abs(d_lvl)/max(b2,1e-9)*100:.2f}%"],
-        ["신용스프레드 ±1%p (위험 곡선만)", f"{d_spr:+,.4f}",
-         f"{abs(d_spr)/max(b2,1e-9)*100:.2f}%"],
-        ["변동성 ±10%p", f"{d_vol:+,.4f}", f"{abs(d_vol)/max(b2,1e-9)*100:.2f}%"],
-        ["금리 수준 ÷ 주가 민감도", f"{ratio:.3f}", ""],
-        [f"{t.T:.2f}년 신용스프레드", f"{spr*100:.2f}%p", f"할인율 중 {share*100:.0f}%"]],
-        columns=["항목", "값", "비중"]), use_container_width=True, hide_index=True)
-    if ratio < 0.2 or share > 0.7:
-        st.success("금리를 확률변수로 둘 실익이 작습니다. 신용스프레드가 값을 지배하므로 "
-                   "금리 고정 격자로 충분합니다.")
-    else:
-        st.warning("금리 수준 민감도가 무시할 수준이 아닙니다. BDT 등 금리모형 적용 여부를 "
-                   "검토하고 그 판단을 조서에 남기십시오. 특히 잔존기간이 길고 조기상환권이 "
-                   "액면 근처에서 자주 열리면 행사 판단 자체가 금리에 좌우됩니다.")
-    st.caption("두 곡선을 함께 흔드는 이유 — 부채 부분은 위험이자율로 할인되므로 "
-               "무위험 곡선만 흔들면 스프레드 변화와 상쇄되어 노출이 최대 수십 배 "
-               "과소하게 잡힙니다. 참고로 책 [사례 4-3] 은 금리변동성 20%를 넣어도 "
-               "조기상환권이 832.14에서 836.22로 0.49%만 움직인다고 실측합니다. "
-               "민감도가 크더라도 금리변동성이 낮으면 값 차이는 작을 수 있습니다.")
 
 with tabs[9]:
     st.write("가정 · 트리 시트 · 이자율곡선 · 결과 · 회계처리 · 상각표로 이루어진 조서를 만듭니다. "
