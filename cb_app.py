@@ -235,6 +235,32 @@ def rating_idx(r: str) -> int:
     return -1
 
 
+# 긴 등급부터 맞춰야 'BBB-' 를 'BB' 로 잘못 집지 않는다. 앞뒤로 다른 알파벳이
+# 붙으면 등급이 아니다 — 그래야 'CD(91일)' 을 등급 C 로 집지 않는다.
+_RATING_PAT = re.compile(
+    r"(?<![A-Z])(?:" + "|".join(sorted((re.escape(r) for r in RATINGS),
+                                       key=len, reverse=True)) + r")(?![A-Z])")
+
+
+def rating_in(text) -> str:
+    """문자열 안에서 신용등급을 찾는다. 못 찾으면 None.
+
+    고시표의 줄 이름은 '회사채 I(공모사채) / 무보증 / BBB0' 처럼 등급이 뒤에
+    붙는다. 그 줄이 어느 등급인지 알아야 화면에서 **표에 실제로 있는 등급만**
+    고르게 할 수 있다.
+    """
+    t = (text or "").upper().replace(" ", "")
+    m = _RATING_PAT.search(t)
+    if m: return m.group(0)
+    # 'AA' · 'BBB' 처럼 0 을 안 붙인 표기. 뒤에 숫자가 붙으면 'CP(A2)' 처럼
+    # 다른 척도의 기호이므로 등급으로 보지 않는다.
+    m = re.search(r"(?<![A-Z])(AAA|AA|A|BBB|BB|B|CCC|CC|C|D)(?![A-Z0-9+\-])", t)
+    if m:
+        c = m.group(1)
+        return c if c in RATINGS else (c+"0" if c+"0" in RATINGS else None)
+    return None
+
+
 def blend_curves(pts_a, pts_b, ra, rb, rt):
     """두 등급 곡선을 노치 거리로 선형보간해 대상 등급 곡선을 만든다.
 
@@ -969,7 +995,28 @@ def read_upload(name: str, data: bytes) -> str:
         wb.close()
         return "\n".join(out)
     if low.endswith(".xls"):
-        raise ValueError("옛 형식(.xls)은 읽지 못합니다. 엑셀에서 .xlsx 로 저장해 주십시오.")
+        try:
+            import xlrd                              # 옛 형식은 xlrd 만 읽는다
+        except ImportError:
+            raise ValueError(
+                "옛 형식(.xls)을 읽으려면 xlrd 가 필요합니다. requirements.txt 에 "
+                "xlrd>=2.0 을 넣고 앱을 다시 시작하시거나, 엑셀에서 .xlsx 로 "
+                "저장해 다시 넣으십시오.") from None
+        bk = xlrd.open_workbook(file_contents=data)
+        sh = bk.sheet_by_index(0)
+        out = []
+        for r in range(sh.nrows):
+            cells = []
+            for c in range(sh.ncols):
+                v, ty = sh.cell_value(r, c), sh.cell_type(r, c)
+                if ty == xlrd.XL_CELL_DATE:
+                    y, mo, d = xlrd.xldate_as_tuple(v, bk.datemode)[:3]
+                    v = f"{y:04d}-{mo:02d}-{d:02d}"
+                elif isinstance(v, float) and v == int(v) and abs(v) < 1e15:
+                    v = int(v)
+                cells.append("" if v is None else str(v))
+            if any(cells): out.append("\t".join(cells))
+        return "\n".join(out)
     for enc in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
         try:
             txt = data.decode(enc)
@@ -1184,11 +1231,16 @@ def _tenor_years(label) -> float:
     return v/12 if v > 12 else (v if v > 0 else None)
 
 
-def parse_rate_matrix(txt: str):
-    """일자 × 만기 표를 읽는다. 첫 열이 일자, 머리글이 만기다.
+def parse_rate_panel(txt: str):
+    """일자 × (등급·만기) 표를 읽는다. 머리 줄이 여러 개여도 된다.
 
-    금투협·KIS-Net 에서 등급 하나의 시계열을 내려받으면 이 꼴이다.
-    반환은 ([만기(년)], [(일자, [수익률…])]) 이고 수익률은 % 단위 그대로다.
+    금투협 시계열은 열마다 '회사채 I(공모사채) /무보증 / BBB0' 같은 등급명과
+    '5년' 같은 만기가 **서로 다른 머리 줄**에 있다. 그래서 열별로 머리 줄을
+    모두 모아 등급과 만기를 찾는다. 한 파일에 등급이 여럿이어도 갈라 읽고,
+    등급 표기가 없으면 만기만 읽어 종전의 일자 × 만기 표와 같아진다.
+
+    반환은 ([(등급, 만기(년), 열번호)], [(일자, [값…])]) 이고, 등급·만기는
+    못 찾으면 None 이다. 수익률은 % 단위 그대로다.
     """
     lines = [l for l in (x.rstrip() for x in txt.splitlines()) if l.strip()]
     if not lines: return [], []
@@ -1198,30 +1250,63 @@ def parse_rate_matrix(txt: str):
         return [x.strip() for x in re.split(r"[\t,;]|\s{2,}", l)]
 
     isdate = lambda x: bool(re.match(r"^\d{4}[-./]\d{1,2}[-./]\d{1,2}$", x.strip()))
-    hdr, body = None, []
+    heads, body = [], []
     for l in lines:
         c = cut(l)
         if c and isdate(c[0]):
             body.append(c)
-        elif hdr is None and len(c) >= 2:
-            hdr = c                                  # 첫 비날짜 줄을 머리글로
-    if hdr is None or len(body) < 10: return [], []
-    ten = [(j, _tenor_years(hdr[j])) for j in range(1, len(hdr))]
-    ten = [(j, y) for j, y in ten if y]
-    if not ten: return [], []
+        elif not body and len(c) >= 2:
+            heads.append(c)                          # 자료가 나오기 전은 다 머리다
+    if not heads or len(body) < 10: return [], []
+    ncol = max([len(h) for h in heads] + [len(b) for b in body])
+    cols = []
+    for j in range(1, ncol):
+        cells = [h[j] for h in heads if j < len(h)]
+        rt = next((r for r in (rating_in(c) for c in cells) if r), None)
+        tn = next((y for y in (_tenor_years(c) for c in cells) if y), None)
+        if rt or tn: cols.append((rt, tn, j))
+    if not cols: return [], []
     rows = []
     for c in body:
         vals = []
-        for j, _ in ten:
+        for _, _, j in cols:
             try:
                 vals.append(float(c[j].replace(",", "").replace("%", "")))
             except Exception:
                 vals.append(None)
         if any(v is not None and v > 0 for v in vals):
-            d = c[0].replace(".", "-").replace("/", "-").split("-")
-            rows.append((f"{d[0]}-{int(d[1]):02d}-{int(d[2]):02d}", vals))
+            d = re.split(r"[-./]", c[0].strip())
+            rows.append((f"{int(d[0]):04d}-{int(d[1]):02d}-{int(d[2]):02d}", vals))
     if len(rows) >= 2 and rows[0][0] > rows[-1][0]: rows.reverse()
-    return [y for _, y in ten], rows
+    return cols, rows
+
+
+def panel_series(cols, rows, T: float):
+    """패널을 등급별 고정만기 시계열로 접는다.
+
+    한 등급에 만기가 여럿이면 그날 곡선에서 잔존만기 T 지점을 뽑고, 하나뿐이면
+    그 만기를 그대로 쓴다 — 고시표가 5년 한 열만 주는 일이 흔하다. 만기를
+    먼저 맞추고 변동성은 나중에 계산해야 만기 이동 효과가 σ 에 섞이지 않는다.
+
+    반환은 ({등급: [(일자, 금리)]}, {등급: [만기(년)…]}) 이다.
+    """
+    byr = {}
+    for k, (rt, tn, _) in enumerate(cols):
+        if tn is not None: byr.setdefault(rt, []).append((tn, k))
+    ser, tens = {}, {}
+    for rt, items in byr.items():
+        items.sort()
+        out = []
+        for d, vals in rows:
+            pts = [(tn, vals[k]) for tn, k in items
+                   if vals[k] is not None and vals[k] > 0]
+            if not pts: continue
+            y = _lin(pts, T)
+            if y and y > 0: out.append((d, y))
+        if len(out) >= 10:
+            ser[rt] = out
+            tens[rt] = [tn for tn, _ in items]
+    return ser, tens
 
 
 def cm_series(tenors, rows, T: float):
@@ -3401,14 +3486,14 @@ with st.sidebar:
             _rmode = st.radio("자료", ["single", "blend"], horizontal=True,
                               key="rvmode",
                               format_func=lambda x: "단일 시계열" if x == "single"
-                              else "등급·만기 보간")
+                              else "등급 보간")
             _rt = int(st.number_input("연 거래일수", value=250, step=5,
                                       min_value=30, key="rvtd"))
             _rdrop = st.checkbox("이상치 제거 (MAD 2.5배)", value=True, key="rvdrop")
             _ser, _how = None, ""
+            _RVX = ["xls", "xlsx", "xlsm", "csv", "txt", "tsv"]
             if _rmode == "single":
-                _f1 = st.file_uploader("금리 시계열 (일자 · 금리)",
-                                       type=["xlsx", "xlsm", "csv", "txt", "tsv"],
+                _f1 = st.file_uploader("금리 시계열 (일자 · 금리)", type=_RVX,
                                        key="rv1")
                 if _f1 is not None:
                     try:
@@ -3417,41 +3502,69 @@ with st.sidebar:
                     except Exception as ex:
                         st.error(str(ex))
             else:
-                st.caption(f"이자율 칸의 등급 설정을 그대로 씁니다 — "
-                           f"**{t.rt_a} · {t.rt_b} → {t.rt_tgt}**, "
-                           f"잔존만기 **{t.T:.2f}년**. 두 파일 모두 "
-                           "첫 열이 일자, 머리글이 만기여야 합니다.")
-                _fa = st.file_uploader(f"{t.rt_a} 시계열", key="rva",
-                                       type=["xlsx", "xlsm", "csv", "txt", "tsv"])
-                _fb = st.file_uploader(f"{t.rt_b} 시계열", key="rvb",
-                                       type=["xlsx", "xlsm", "csv", "txt", "tsv"])
-                if _fa is not None:
+                st.caption("첫 열이 일자이고 머리 줄에 **등급과 만기**가 있으면 "
+                           "한 파일에 등급이 여럿이어도 갈라 읽습니다. 등급을 "
+                           "따로 받으셨으면 두 번째 칸에 넣으십시오.")
+                _fa = st.file_uploader("금리 시계열", type=_RVX, key="rva")
+                _fb = st.file_uploader("두 번째 파일 (선택)", type=_RVX, key="rvb")
+                _pool, _tens, _seen = {}, {}, False
+                for _f in (_fa, _fb):
+                    if _f is None: continue
+                    _seen = True
                     try:
-                        _ta, _ra = parse_rate_matrix(read_upload(_fa.name, _fa.getvalue()))
-                        _sa = cm_series(_ta, _ra, t.T)
-                        _sb = []
-                        if _fb is not None:
-                            _tb, _rb = parse_rate_matrix(read_upload(_fb.name, _fb.getvalue()))
-                            _sb = cm_series(_tb, _rb, t.T)
-                        if not _sa:
-                            st.error("만기 머리글을 찾지 못했습니다. 첫 줄에 "
-                                     "`3월 · 1년 · 3년` 같은 만기가 있어야 합니다.")
-                        else:
-                            _ser = blend_series(_sa, _sb, t.rt_a, t.rt_b, t.rt_tgt)
-                            _w = ((rating_idx(t.rt_tgt)-rating_idx(t.rt_a))
-                                  / max(rating_idx(t.rt_b)-rating_idx(t.rt_a), 1)
-                                  if _sb else 0.0)
-                            _how = (f"{t.rt_a}·{t.rt_b} → {t.rt_tgt} (가중치 {_w:.2f}) · "
-                                    f"고정만기 {t.T:.2f}년")
-                            if _sb and not (0 <= _w <= 1):
-                                st.warning(f"평가대상 등급이 두 곡선 **밖**입니다 "
-                                           f"(가중치 {_w:.2f}). 외삽하면 변동성이 "
-                                           "실제와 크게 벌어질 수 있습니다 — 바깥쪽 "
-                                           "등급을 두 번째 곡선으로 쓰는 편이 낫습니다.")
-                            if not _sb:
-                                st.info("두 번째 파일이 없어 첫 곡선을 그대로 씁니다.")
+                        _c, _r = parse_rate_panel(read_upload(_f.name, _f.getvalue()))
+                        _s2, _t2 = panel_series(_c, _r, t.T)
+                        _pool.update(_s2); _tens.update(_t2)
                     except Exception as ex:
-                        st.error(str(ex))
+                        st.error(f"{_f.name} — {ex}")
+                if _seen and not _pool:
+                    st.error("등급이나 만기를 찾지 못했습니다. 머리 줄에 "
+                             "`… / BBB0` 같은 등급이나 `5년` 같은 만기가 "
+                             "있어야 합니다. 자료는 10줄 이상이어야 합니다.")
+                elif _pool:
+                    # 고를 수 있는 것은 **파일에 실제로 있는 등급**뿐이다.
+                    # 고시표에 없는 등급을 곡선으로 고르면 붙일 자료가 없다.
+                    _opt = sorted(_pool, key=lambda r: (r is None, rating_idx(r)))
+                    _nm = lambda r: (r or "등급 미상") + (
+                        f" ({'·'.join(f'{x:g}년' for x in _tens.get(r, []))})"
+                        if _tens.get(r) else "")
+                    st.success("찾은 등급 — " + " · ".join(_nm(r) for r in _opt))
+                    g1, g2 = st.columns(2)
+                    _ia = _opt.index(t.rt_a) if t.rt_a in _opt else 0
+                    _ra = g1.selectbox("곡선 A", _opt, index=_ia,
+                                       format_func=_nm, key="rvga")
+                    _rest = [x for x in _opt if x != _ra]
+                    _ib = (_rest.index(t.rt_b) + 1) if t.rt_b in _rest else 0
+                    _rb = g2.selectbox("곡선 B", [None] + _rest, index=_ib,
+                                       format_func=lambda r: "(없음)" if r is None
+                                       else _nm(r), key="rvgb")
+                    _rtg = st.selectbox(
+                        "평가대상", RATINGS, key="rvgt",
+                        index=RATINGS.index(t.rt_tgt) if t.rt_tgt in RATINGS else 8,
+                        help="두 곡선 사이면 내삽, 밖이면 같은 기울기로 외삽합니다.")
+                    if _rb is None or _ra is None:
+                        _ser = _pool[_ra]
+                        _how = f"{_nm(_ra)} 단일 · 고정만기 {t.T:.2f}년"
+                        st.info("곡선이 하나뿐이라 등급 보간 없이 그대로 씁니다.")
+                    else:
+                        _ser = blend_series(_pool[_ra], _pool[_rb], _ra, _rb, _rtg)
+                        _ja, _jb = rating_idx(_ra), rating_idx(_rb)
+                        _w = ((rating_idx(_rtg)-_ja)/(_jb-_ja)) if _ja != _jb else 0.0
+                        _how = (f"{_ra}·{_rb} → {_rtg} (가중치 {_w:.2f}) · "
+                                f"고정만기 {t.T:.2f}년")
+                        st.caption(f"가중치 — {_ra} {1-_w:.0%} · {_rb} {_w:.0%}")
+                        if not 0 <= _w <= 1:
+                            st.warning(
+                                f"평가대상 **{_rtg}** 가 두 곡선 **밖**입니다 "
+                                f"(가중치 {_w:.2f}). 등급 간 스프레드는 아래로 "
+                                "갈수록 가속해서 벌어지므로, 직선으로 뻗는 외삽은 "
+                                "금리를 낮게 잡습니다. 평가대상을 사이에 끼우는 "
+                                "등급을 받아 오시는 편이 낫습니다.")
+                    _tn = _tens.get(_ra) or []
+                    if len(_tn) == 1 and abs(_tn[0] - t.T) > 0.5:
+                        st.warning(f"파일의 만기가 **{_tn[0]:g}년** 한 열뿐인데 "
+                                   f"잔존만기는 **{t.T:.2f}년** 입니다. 만기 보간을 "
+                                   "할 수 없으므로 그 차이를 조서에 적으십시오.")
             if _ser and len(_ser) >= 10:
                 _v = rate_vol(_ser, _rt, _rdrop)
                 if _v:
@@ -3687,6 +3800,8 @@ with st.sidebar:
                     st.session_state.cr_txt = curve_text(_rows[_ci][1])
                     st.session_state.kis_src = (_lbl[_ri], _lbl[_ci])
                     st.rerun()
+                # 등급 보간 칸이 같은 표에서 곡선을 고를 수 있도록 남긴다
+                st.session_state.kis_rows = _rows
         if st.session_state.get("kis_src"):
             st.caption("적용된 곡선 — 무위험 **%s** · 위험 **%s**"
                        % st.session_state["kis_src"])
@@ -3712,13 +3827,34 @@ with st.sidebar:
             t.cr_curve = parse_yields(cr_txt, unit)
             t.cr_curve_b = []
         else:
+            # 표를 올리셨으면 **그 표에 있는 등급만** 고르게 한다. 고시표에 없는
+            # 등급을 곡선으로 고르면 붙여 넣을 자료가 없다 — 무보증 공모사채는
+            # 대개 BBB- 까지만 고시한다.
+            _kr = st.session_state.get("kis_rows") or []
+            _kg = [(i, rating_in(L)) for i, (L, _) in enumerate(_kr)]
+            _kg = [(i, g) for i, g in _kg if g]
+            _pick = sorted({g for _, g in _kg}, key=rating_idx)
+            _opts = _pick or RATINGS
+            _at = lambda r, d: _opts.index(r) if r in _opts else min(d, len(_opts)-1)
             r1, r2, r3 = st.columns(3)
-            t.rt_a = r1.selectbox("곡선 A", RATINGS,
-                                  index=RATINGS.index(t.rt_a) if t.rt_a in RATINGS else 7)
-            t.rt_b = r2.selectbox("곡선 B", RATINGS,
-                                  index=RATINGS.index(t.rt_b) if t.rt_b in RATINGS else 9)
-            t.rt_tgt = r3.selectbox("평가대상", RATINGS,
-                                    index=RATINGS.index(t.rt_tgt) if t.rt_tgt in RATINGS else 8)
+            # 표가 없으면 종전 기본값(BBB+ · BBB-), 있으면 가장 위·아래 등급
+            t.rt_a = r1.selectbox("곡선 A", _opts, index=_at(t.rt_a, 0 if _pick else 7))
+            t.rt_b = r2.selectbox("곡선 B", _opts,
+                                  index=_at(t.rt_b, len(_opts)-1 if _pick else 9))
+            t.rt_tgt = r3.selectbox(
+                "평가대상", RATINGS,
+                index=RATINGS.index(t.rt_tgt) if t.rt_tgt in RATINGS else 8,
+                help="곡선 두 개 사이면 내삽, 밖이면 같은 기울기로 외삽합니다. "
+                     "평가대상은 표에 없어도 고를 수 있습니다.")
+            if _pick:
+                st.caption("올리신 표에 있는 등급 — **" + " · ".join(_pick)
+                           + "**. 두 곡선은 이 안에서만 고를 수 있습니다.")
+                if st.button("고른 두 등급으로 채우기", use_container_width=True):
+                    _byg = {}
+                    for i, g in _kg: _byg.setdefault(g, i)
+                    st.session_state.ca_txt = curve_text(_kr[_byg[t.rt_a]][1])
+                    st.session_state.cb_txt = curve_text(_kr[_byg[t.rt_b]][1])
+                    st.rerun()
             if "ca_txt" not in st.session_state:
                 st.session_state.ca_txt = "12\t4.60%\n36\t5.40%\n60\t6.10%"
             if "cb_txt" not in st.session_state:
@@ -3730,6 +3866,12 @@ with st.sidebar:
             ia, ib, it2 = rating_idx(t.rt_a), rating_idx(t.rt_b), rating_idx(t.rt_tgt)
             if ia >= 0 and ib >= 0 and it2 >= 0 and ia != ib:
                 w = (it2-ia)/(ib-ia)
+                if not 0 <= w <= 1:
+                    st.warning(f"평가대상 **{t.rt_tgt}** 가 두 곡선 **밖**입니다 "
+                               f"(가중치 {w:.2f}). 등급 간 스프레드는 아래로 갈수록 "
+                               "가속해서 벌어지므로, 직선으로 뻗는 외삽은 금리를 "
+                               "낮게 잡습니다. 평가대상을 사이에 끼우는 등급을 "
+                               "받아 오시는 편이 낫습니다.")
                 st.caption(f"가중치 — {t.rt_a} {1-w:.0%} · {t.rt_b} {w:.0%}"
                            + ("   (등급 범위 밖이라 외삽합니다)" if not 0 <= w <= 1 else ""))
         cc = credit_curve(t)
