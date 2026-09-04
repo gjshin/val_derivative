@@ -57,6 +57,7 @@ class Terms:
     p_lost_int: int = 0           # 조기상환 행사금액이 상실이자 보상 수준인가
     fvpl_whole: int = 0           # 복합계약 전체를 당기손익-공정가치로 지정했는가
     k_method: int = 0
+    p_sep: int = 1                  # 조기상환권 1 분리 / 0 주계약에 포함
     k_sep: int = 1                  # 1 별도 금융상품 / 0 복합내재파생에 포함            # 0 유무가치비교 / 1 혼합할인율 / 2 지분·부채 분리
     sig: float = 0.4130
     model: str = "TF"
@@ -872,6 +873,17 @@ def split_test(tm: Terms, full, b0, b1, b2, ca, rows_eir):
     # 화면에서 고른 회계 처리와 판정이 어긋나면 알린다
     want = 1 if out["call"]["결론"] == "별도의 금융상품" else 0
     out["call"]["설정일치"] = (not out["call"]["있음"]) or (tm.k_sep == want)
+    # 조기상환권도 같다. 다만 스위치가 살아 있을 때만 본다 — 매도청구권을
+    # 내재파생으로 묶거나 전환권이 부채면 조기상환권은 묶음에 딸려 분리된다.
+    _live = tm.conv_class == "equity" and tm.k_sep != 0
+    _res = out["put"]["결론"]
+    if not out["put"]["있음"] or not _live or _res == "분리하지 않을 여지":
+        # 「여지」는 어느 쪽으로도 갈 수 있다. 어긋났다고 하지 않는다.
+        out["put"]["설정일치"] = True
+    else:
+        out["put"]["설정일치"] = (int(tm.p_sep) ==
+                                (1 if _res in ("분리", "묶어서 분리") else 0))
+    out["put"]["스위치"] = _live
     return out
 
 
@@ -905,6 +917,11 @@ def allocate(tm: Terms, full, b0, b1, b2, ca):
     다를 뿐이다.
     """
     sep = tm.k_sep != 0
+    # 조기상환권을 분리하지 않는 선택은 **전환권이 자본이고 매도청구권이 별도
+    # 금융상품일 때**만 살아 있다. 매도청구권을 내재파생으로 묶으면 문단 B4.3.4
+    # 가 복수의 내재파생을 하나의 복합내재파생으로 다루라고 하므로 조기상환권도
+    # 그 묶음에 딸려 분리된다. 전환권이 부채면 애초에 묶음으로 재므로 마찬가지다.
+    psep = not (tm.conv_class == "equity" and sep and int(tm.p_sep) == 0)
     if tm.conv_class == "liability":
         # 전환권이 파생상품부채 — 내재파생을 공정가치로 두고 주계약을 잔여로.
         # 전환권과 조기상환권은 상호의존적이라 하나의 복합내재파생상품으로 묶어
@@ -924,6 +941,18 @@ def allocate(tm: Terms, full, b0, b1, b2, ca):
                    "매도청구권은 발행회사만 행사할 수 있어 거래상대방이 그대로이므로 "
                    "내재파생상품이고, 같은 묶음에 넣어 순액으로 측정합니다 (문단 4.3.1).")
                 + f" 이론적 주계약가치는 {b0:,.2f} 입니다.")
+    elif not psep:
+        # 조기상환권이 주계약과 밀접하게 관련되어 분리하지 않는다. 부채요소를
+        # 통째로 상각후원가로 두고, 파생상품부채를 세우지 않는다.
+        rows = [("부채요소 (사채 + 조기상환권)", b1),
+                ("매도청구권 · 파생상품자산", -ca),
+                ("전환권대가 · 자본", 100-b1+ca)]
+        note = ("기업회계기준서 제1032호 문단 31 — 부채요소를 먼저 정하고 나머지를 자본에 "
+                "배분합니다. 최초 인식에는 손익이 생기지 않습니다. "
+                "조기상환청구권은 주계약과 밀접하게 관련되어 분리하지 않으므로 "
+                "(제1109호 문단 4.3.3·B4.3.5(5)(가)) 부채요소에 포함해 상각후원가로 "
+                f"측정합니다. 분리했다면 파생상품부채로 세웠을 금액은 {b1-b0:,.2f} "
+                "입니다 — 분리하지 않으므로 인식하지 않고, 유효이자율에 녹아 듭니다.")
     else:
         rows = [("주계약 (옵션 없는 사채)", b0),
                 ("조기상환청구권 · 파생상품부채", (b1-b0) if sep else (b1-b0-ca))]
@@ -2154,6 +2183,9 @@ def build_xlsx(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     N2, N0, P2, N4, N6 = '#,##0.00', '#,##0', '0.00%', '0.0000', '0.000000'
     DATE = 'yyyy-mm-dd'
     n = tm.n; dt_ = tm.T/n; mper = n/(tm.T*12); R0 = 20
+    # 조기상환권을 분리하지 않는 선택이 실제로 살아 있는가. allocate 와 같은
+    # 조건이어야 가정 시트·회계처리 표가 배분표와 어긋나지 않는다.
+    _nosep = (tm.conv_class == "equity" and tm.k_sep != 0 and int(tm.p_sep) == 0)
     # 계약상 개월 → 평가기준일 기준 스텝. 엔진과 같아야 한다 (경과분을 뺀다).
     stp_lo, stp_hi = step_mapper(tm, n, dt_)
     per_ = lambda mth: max(1, int(round(mth*mper)))   # 주기는 뺄 것이 없다
@@ -2278,6 +2310,9 @@ def build_xlsx(tm: Terms, full, b0, b1, b2, ca, conv, eir):
       ("4. 옵션", [("전환 시작 / 종료 (개월)", tm.cv_s, N0), ("　", tm.cv_e, N0),
         ("조기상환 시작 / 종료 / 주기", tm.p_s, N0), ("　", tm.p_e, N0), ("　 ", tm.p_f, N0),
         ("조기상환 행사금액 산정", "보장수익률 복리" if tm.p_mode == "accrue" else "고정률", None),
+        ("조기상환권 회계 처리",
+         ("분리하지 않음 · 부채요소에 포함" if _nosep else "분리 · 파생상품부채"),
+         None),
         ("매도청구 시작 / 종료 / 주기", tm.k_s, N0), ("　  ", tm.k_e, N0), ("　   ", tm.k_f, N0),
         ("매도청구 프리미엄", tm.k_prem, P2),
         ("매도청구 복리 횟수 (연)", tm.k_cmp, N0), ("매도청구 한도", tm.k_w, P2),
@@ -2722,6 +2757,9 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     N2, N0, P2, N4, N6 = '#,##0.00', '#,##0', '0.00%', '0.0000', '0.000000'
     DATE = 'yyyy-mm-dd'
     n = tm.n; dt_ = tm.T/n; mper = n/(tm.T*12); R0 = 20
+    # 조기상환권을 분리하지 않는 선택이 실제로 살아 있는가. allocate 와 같은
+    # 조건이어야 가정 시트·회계처리 표가 배분표와 어긋나지 않는다.
+    _nosep = (tm.conv_class == "equity" and tm.k_sep != 0 and int(tm.p_sep) == 0)
     el = tm.elapsed_m
     # 트랜치 이름은 계약의 매도청구 한도에서 나온다. 30/70 으로 굳혀 두면
     # 한도가 다른 사채에서 시트 이름이 계약과 어긋난다.
@@ -2816,6 +2854,7 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
         ("전환권 분류 (1 자본 / 0 부채)", "eqcls", 1 if tm.conv_class == "equity" else 0, N0, True),
         ("매도청구권 평가방법 (0 유무가치 / 1 혼합할인율 / 2 지분·부채 분리)",
          "kmeth", tm.k_method, N0, True),
+        ("조기상환권 처리 (1 분리 / 0 부채요소에 포함)", "psep", int(tm.p_sep), N0, True),
         ("매도청구권 처리 (1 별도 금융상품 / 0 내재파생 포함)", "ksep", tm.k_sep, N0, True),
         ("신용위험 처리 (0 TF / 1 GS)", "mdl", 1 if tm.model == "GS" else 0, N0, True),
         ("조기상환권 (0 금리고정 / 1 BDT)", "pbdt", 1 if put_bdt_on(tm) else 0, N0, True),
@@ -3545,7 +3584,9 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     sec(M, 5, "유효이자율 역산", span=6)
     for i, (k, fx, fm, val) in enumerate([
             # 부채로 분류하면 잔여로 떨어진 금액이 인식액이다. 이론값(C16)이 아니다.
-            ("주계약 (인식액)", f'=IF({K["eqcls"]}=1,결과!C16,결과!C25)', N2, None),
+            ("주계약 (인식액)",
+             f'=IF({K["eqcls"]}=1,IF(AND({K["ksep"]}=1,{K["psep"]}=0),결과!C17,'
+             f'결과!C16),결과!C25)', N2, None),
             ("만기상환금액", f"={K['red']}", N2, None),
             ("표면이자 (회당)", f"=100*{K['cpn']}*{K['ipaym']}/12", N2, None),
             ("상각 횟수", None, N0, nper)]):
@@ -3611,35 +3652,46 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
     # 매도청구권을 별도 금융상품으로 볼지 내재파생에 넣을지에 따라 표가 갈린다.
     # 넣는 쪽이면 파생 줄에서 콜을 빼고 자산 줄을 비운다. 합계는 어느 쪽이든 100.
     KS = K["ksep"]
-    al2 = [("주계약", f'=IF({K["eqcls"]}=1,결과!C16,결과!C25)'),
-           ("조기상환청구권 · 파생상품부채",
-            f'=IF({K["eqcls"]}=0,"",IF({KS}=1,결과!C18,결과!C18-결과!C22))'),
-           ("복합내재파생상품 · 파생상품부채",
-            f'=IF({K["eqcls"]}=1,"",IF({KS}=1,결과!C24,결과!C24-결과!C22))'),
-           ("매도청구권 · 파생상품자산", f'=IF({KS}=1,-결과!C22,"")'),
-           ("전환권대가 · 자본", f'=IF({K["eqcls"]}=1,결과!C23,"")')]
+    # 조기상환권을 분리하지 않는 갈래. 전환권이 자본이고 매도청구권이 별도
+    # 금융상품일 때만 살아 있다 — 매도청구권을 내재파생으로 묶으면 문단
+    # B4.3.4 가 하나의 복합내재파생으로 다루라고 해서 조기상환권도 딸려 간다.
+    NS = f'AND({K["eqcls"]}=1,{KS}=1,{K["psep"]}=0)'
+    _HOST = f'=IF({K["eqcls"]}=1,IF({NS},"",결과!C16),결과!C25)'
+    _PUT = (f'=IF(OR({K["eqcls"]}=0,{NS}),"",'
+            f'IF({KS}=1,결과!C18,결과!C18-결과!C22))')
+    _LIAB = f'=IF({NS},결과!C17,"")'
+    _CMP = f'=IF({K["eqcls"]}=1,"",IF({KS}=1,결과!C24,결과!C24-결과!C22))'
+    _CALL = f'=IF({KS}=1,-결과!C22,"")'
+    _EQ = f'=IF({K["eqcls"]}=1,결과!C23,"")'
+    al2 = [("주계약", _HOST),
+           ("부채요소 (사채 + 조기상환권)", _LIAB),
+           ("조기상환청구권 · 파생상품부채", _PUT),
+           ("복합내재파생상품 · 파생상품부채", _CMP),
+           ("매도청구권 · 파생상품자산", _CALL),
+           ("전환권대가 · 자본", _EQ)]
     for i, (nm, fx) in enumerate(al2):
         r = 7+i
         put(E, r, 2, nm, border=True)
         put(E, r, 3, fx, fmt=N2, align="right", border=True)
         put(E, r, 4, f'=IF(ISNUMBER(C{r}),C{r}/100*{K["face"]},"")',
             fmt=N0, align="right", border=True)
-    put(E, 12, 2, "합계", bold=True, fill=BAND, border=True)
-    put(E, 12, 3, "=SUM(C7:C11)", bold=True, fill=BAND, fmt=N2, align="right", border=True)
-    put(E, 12, 4, "=SUM(D7:D11)", bold=True, fill=BAND, fmt=N0, align="right", border=True)
-    sec(E, 14, "2. 분개", span=5)
+    put(E, 13, 2, "합계", bold=True, fill=BAND, border=True)
+    put(E, 13, 3, "=SUM(C7:C12)", bold=True, fill=BAND, fmt=N2, align="right", border=True)
+    put(E, 13, 4, "=SUM(D7:D12)", bold=True, fill=BAND, fmt=N0, align="right", border=True)
+    put(E, 14, 2, "주계약과 부채요소는 서로 배타적이다 — 조기상환권을 분리하면 위 줄이, "
+        "분리하지 않으면 아래 줄이 찬다.", color=GREY, size=9)
+    sec(E, 16, "2. 분개", span=5)
     for i, h in enumerate(["계정", "차변 (100)", "대변 (100)", "차변 (원)", "대변 (원)"]):
-        put(E, 15, 2+i, h, bold=True, fill=LIGHT, align="center", border=True, size=9)
+        put(E, 17, 2+i, h, bold=True, fill=LIGHT, align="center", border=True, size=9)
     je2 = [("현금", "=100", None),
            ("파생상품자산 (매도청구권)", f'=IF({KS}=1,결과!C22,"")', None),
-           ("　전환사채 (주계약)", None, f'=IF({K["eqcls"]}=1,결과!C16,결과!C25)'),
-           ("　파생상품부채 (조기상환청구권)", None,
-            f'=IF({K["eqcls"]}=0,"",IF({KS}=1,결과!C18,결과!C18-결과!C22))'),
-           ("　파생상품부채 (복합내재파생상품)", None,
-            f'=IF({K["eqcls"]}=1,"",IF({KS}=1,결과!C24,결과!C24-결과!C22))'),
-           ("　전환권대가 (자본)", None, f'=IF({K["eqcls"]}=1,결과!C23,"")')]
+           ("　전환사채 (주계약)", None, _HOST),
+           ("　전환사채 (부채요소)", None, _LIAB),
+           ("　파생상품부채 (조기상환청구권)", None, _PUT),
+           ("　파생상품부채 (복합내재파생상품)", None, _CMP),
+           ("　전환권대가 (자본)", None, _EQ)]
     for i, (nm, dr, cr) in enumerate(je2):
-        r = 16+i
+        r = 18+i
         put(E, r, 2, nm, size=9, border=True)
         put(E, r, 3, dr if dr else "", fmt=N2, align="right", border=True)
         put(E, r, 4, cr if cr else "", fmt=N2, align="right", border=True)
@@ -3647,13 +3699,13 @@ def build_xlsx_formula(tm: Terms, full, b0, b1, b2, ca, conv, eir):
             fmt=N0, align="right", border=True)
         put(E, r, 6, f'=IF(ISNUMBER(D{r}),D{r}/100*{K["face"]},"")',
             fmt=N0, align="right", border=True)
-    put(E, 22, 2, "합계", bold=True, fill=BAND, border=True)
+    put(E, 25, 2, "합계", bold=True, fill=BAND, border=True)
     for j2, col in enumerate("CDEF"):
-        put(E, 22, 3+j2, f"=SUM({col}16:{col}21)", bold=True, fill=BAND,
+        put(E, 25, 3+j2, f"=SUM({col}18:{col}24)", bold=True, fill=BAND,
             fmt=(N2 if j2 < 2 else N0), align="right", border=True)
-    put(E, 23, 2, "차변과 대변이 일치해야 한다", bold=True, border=True)
-    put(E, 23, 3, '=IF(ABS(C22-D22)<0.01,"적합","오류")', align="center", border=True)
-    put(E, 25, 2, "최초 인식에는 어떠한 손익도 생기지 않는다.", color=GREY, size=9)
+    put(E, 26, 2, "차변과 대변이 일치해야 한다", bold=True, border=True)
+    put(E, 26, 3, '=IF(ABS(C25-D25)<0.01,"적합","오류")', align="center", border=True)
+    put(E, 28, 2, "최초 인식에는 어떠한 손익도 생기지 않는다.", color=GREY, size=9)
 
     # ── 분리 판단 ──
     # 화면과 같은 함수가 만든 문안이라 둘이 어긋날 수 없다.
@@ -3852,6 +3904,29 @@ with st.sidebar:
             t.p_yield = st.number_input("조기상환 보장수익률 (%)", value=t.p_yield*100, step=0.5)/100
             t.p_cmp = int(st.number_input("복리 횟수 (연)", value=int(t.p_cmp), step=1, min_value=1))
             st.caption("행사금액 = 100 × (1 + 실효수익률)^경과연수")
+
+        st.divider()
+        st.markdown("**회계 처리**")
+        _psok = (t.conv_class == "equity" and t.k_sep != 0)
+        t.p_sep = 1 if st.selectbox(
+            "조기상환권 처리", [1, 0], index=0 if int(t.p_sep) else 1,
+            format_func=lambda x: ("분리 · 파생상품부채" if x
+                                   else "분리하지 않음 · 부채요소에 포함"),
+            disabled=not _psok,
+            help="행사금액이 상각후원가와 거의 같으면 주채무계약과 밀접하게 "
+                 "관련되어 분리하지 않습니다 (기준서 1109 문단 B4.3.5(5)(가)). "
+                 "「분리 판단」 탭이 계약 조항으로 이 결론을 내 줍니다.") else 0
+        if not _psok:
+            st.caption("전환권을 **자본**으로 두고 매도청구권을 **별도 금융상품**으로 "
+                       "볼 때만 고를 수 있습니다. 매도청구권을 내재파생으로 묶으면 "
+                       "복수의 내재파생을 하나의 복합내재파생으로 다루므로 "
+                       "(문단 B4.3.4) 조기상환권도 함께 분리됩니다. 전환권이 "
+                       "부채여도 같은 이유로 묶음에 들어갑니다.")
+            t.p_sep = 1
+        elif int(t.p_sep) == 0:
+            st.caption("부채요소(사채 + 조기상환권)를 통째로 상각후원가로 둡니다. "
+                       "파생상품부채를 세우지 않고, 상각표도 부채요소에서 "
+                       "출발합니다. 전환권대가는 어느 쪽이든 같습니다.")
 
         st.divider()
         st.markdown("**평가 방법**")
@@ -4533,6 +4608,21 @@ with tabs[2]:
                 columns=["항목", "값"]), use_container_width=True, hide_index=True)
         st.markdown("**평가방법** — " + _d["평가"])
 
+    if not _sp["put"]["설정일치"]:
+        st.error("사이드바의 **조기상환청구권 → 회계 처리** 설정이 위 판정과 "
+                 f"어긋납니다. 판정은 **{_sp['put']['결론']}** 인데 설정은 "
+                 + ("분리 · 파생상품부채" if int(t.p_sep) else "분리하지 않음")
+                 + " 입니다. 배분표와 분개가 판정과 다르게 나오므로 사이드바에서 "
+                   "맞추십시오.")
+    elif (_sp["put"].get("스위치") and _sp["put"]["결론"] == "분리하지 않을 여지"):
+        st.info("조기상환권은 **어느 쪽도 설명할 수 있는** 자리입니다. 지금 설정은 "
+                + ("**분리 · 파생상품부채**" if int(t.p_sep)
+                   else "**분리하지 않음 · 부채요소에 포함**")
+                + " 입니다. 사이드바 **조기상환청구권 → 회계 처리** 에서 바꿀 수 "
+                  "있고, 어느 쪽을 골랐는지와 그 이유를 조서에 적으십시오. "
+                  "전환권대가는 어느 쪽이든 같고, 갈리는 것은 부채 표시와 "
+                  "후속측정입니다 — 분리하면 파생상품부채를 매기 공정가치로 "
+                  "재평가하고, 분리하지 않으면 부채요소를 상각후원가로 굴립니다.")
     if not _sp["call"]["설정일치"]:
         st.error("사이드바의 **매도청구권 → 회계 처리** 설정이 위 판정과 "
                  f"어긋납니다. 판정은 **{_sp['call']['결론']}** 인데 설정은 "

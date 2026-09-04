@@ -80,6 +80,11 @@ CASES = [
     # 모형·분류
     ("변동성 25%", dict(sig=.25), None),
     ("GS", dict(model="GS"), None),
+    ("조기상환권 미분리", dict(p_sep=0),
+     "트랜치·주계약·부채요소·매도청구권은 그대로다. 바뀌는 것은 배분표와 분개이고 "
+     "그 둘은 매 케이스마다 따로 확인한다."),
+    ("조기상환권 미분리 · 방법1", dict(p_sep=0, k_method=1),
+     "위와 같다. 배분표만 갈린다."),
     ("콜 내재파생 포함", dict(k_sep=0),
      "트랜치·주계약·부채요소·매도청구권은 그대로다. 바뀌는 것은 배분표와 분개이고 "
      "그 둘은 매 케이스마다 따로 확인한다."),
@@ -212,8 +217,8 @@ def run_one(idx):
     out = {"lbl": lbl, "why": why, "ca": eng["dr_want"],
            "vals": [got[res].get(c) for _, c, _ in ROWS],
            "want": [eng[k] for _, _, k in ROWS],
-           "alloc": got[acc].get("C12"),
-           "dr": got[acc].get("C22"), "cr": got[acc].get("D22"),
+           "alloc": got[acc].get("C13"),
+           "dr": got[acc].get("C25"), "cr": got[acc].get("D25"),
            "gap": over.get("_gap", 6.0)}
     print("@@" + json.dumps(out), flush=True)
     return 0

@@ -30,6 +30,11 @@ CASES = [
     ("전환권 부채", dict(conv_class="liability")),
     ("방법2 지분·부채 분리", dict(k_method=2)),
     ("방법2 · 전환권 부채", dict(k_method=2, conv_class="liability")),
+    ("조기상환권 미분리", dict(p_sep=0)),
+    ("조기상환권 미분리 · 방법1", dict(p_sep=0, k_method=1)),
+    ("조기상환권 미분리 · 콜 내재파생 (스위치 꺼짐)", dict(p_sep=0, k_sep=0)),
+    ("조기상환권 미분리 · 전환권 부채 (스위치 꺼짐)",
+     dict(p_sep=0, conv_class="liability")),
     ("콜 내재파생 포함 · 자본", dict(k_sep=0)),
     ("콜 내재파생 포함 · 부채", dict(k_sep=0, conv_class="liability")),
     # 아래 세 건은 리픽싱 주기가 2 스텝 이상이라야 살아나는 경로다.
@@ -126,7 +131,9 @@ def build(G, over, path):
     al, _ = G["allocate"](t, full, b0, b1, b2, ca)
     return dict(b0=b0, b1=b1, b2=b2, gs=full["GS"], b3=b3, ca=ca, conv=conv,
                 ctp1=t.k_w*ctp1, ctp2=t.k_w*ctp2,
-                al=al, eq=(t.conv_class == "equity"), sep=(t.k_sep != 0)), \
+                al=al, eq=(t.conv_class == "equity"), sep=(t.k_sep != 0),
+                nosep=(t.conv_class == "equity" and t.k_sep != 0
+                       and int(t.p_sep) == 0)), \
         mp["결과"], mp["회계처리"]
 
 
@@ -177,19 +184,20 @@ def main():
         # 회계처리 — 배분표 C7:C11 과 분개 차·대변 합계
         A = got[acc]
         want_al = {k.split(" · ")[0].replace(" (잔여)", "").replace(
-                       " (옵션 없는 사채)", ""): v for k, v in eng["al"][:-1]}
+                       " (옵션 없는 사채)", "").replace(
+                       " (사채 + 조기상환권)", ""): v for k, v in eng["al"][:-1]}
         have_al = {}
-        for r in range(7, 12):
+        for r in range(7, 13):
             v = A.get(f"C{r}")
             if v is not None: have_al[r] = v
         # 부호까지 포함해 합이 100 이 되어야 한다
-        tot = A.get("C12")
+        tot = A.get("C13")
         okt = tot is not None and abs(tot - 100.0) < 1e-4
         if not okt: bad += 1
         print("   %-22s 조서 %11s · 기준 %11.4f  %s"
               % ("배분 합계", f"{tot:.4f}" if tot is not None else "없음", 100.0,
                  "" if okt else "★"))
-        drr, crr = A.get("C22"), A.get("D22")
+        drr, crr = A.get("C25"), A.get("D25")
         # 분개는 배분표를 뒤집은 것이다. 음수 항목만 차변으로 간다.
         want_dr = 100 + sum(-v for _, v in eng["al"][:-1] if v < 0)
         okj = (drr is not None and crr is not None
@@ -200,13 +208,18 @@ def main():
                  f"{crr:.4f}" if crr is not None else "없음", want_dr,
                  "" if okj else "★"))
         # 배분 각 줄이 allocate() 와 같은가
-        rows_ord = ([("주계약", 7), ("조기상환청구권", 8), ("매도청구권", 10),
-                     ("전환권대가", 11)] if eng["eq"] else
-                    [("주계약", 7), ("복합내재파생상품", 9), ("매도청구권", 10)])
+        # 7 주계약 · 8 부채요소 · 9 조기상환권 · 10 복합내재파생 · 11 매도청구 · 12 전환권대가
+        if eng["eq"] and eng["nosep"]:
+            rows_ord = [("부채요소", 8), ("매도청구권", 11), ("전환권대가", 12)]
+        elif eng["eq"]:
+            rows_ord = [("주계약", 7), ("조기상환청구권", 9), ("매도청구권", 11),
+                        ("전환권대가", 12)]
+        else:
+            rows_ord = [("주계약", 7), ("복합내재파생상품", 10), ("매도청구권", 11)]
         if not eng["sep"]:
             # 콜을 내재파생에 넣으면 자산 줄이 비고 파생 줄이 순액이 된다
             rows_ord = [(nm, r) for nm, r in rows_ord if nm != "매도청구권"]
-            if eng["eq"]: rows_ord[1] = ("복합내재파생상품", 8)
+            if eng["eq"]: rows_ord[0] = ("주계약", 7); rows_ord[1] = ("복합내재파생상품", 10)
         for nm, r in rows_ord:
             want = want_al.get(nm)
             if nm == "매도청구권": want = -eng["ca"]
